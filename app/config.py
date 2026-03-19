@@ -32,3 +32,7 @@ def get_model_cache_dir() -> Path:
 
 def get_hf_cache_dir() -> Path:
     return get_app_data_dir() / "hf-cache"
+
+
+def get_log_dir() -> Path:
+    return get_app_data_dir() / "logs"
