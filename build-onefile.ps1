@@ -21,4 +21,7 @@ if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
   --collect-all av `
   --collect-all tokenizers `
   --collect-all huggingface_hub `
-  app\main.py
+  --collect-all google.generativeai `
+  --collect-all google.ai.generativelanguage `
+  --collect-all dotenv `
+  launcher.py

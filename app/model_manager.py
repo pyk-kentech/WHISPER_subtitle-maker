@@ -105,7 +105,6 @@ def get_download_plan() -> DownloadPlan:
 
     files: list[DryRunFileInfo] = []
     total_bytes = 0
-
     for filename in MODEL_REQUIRED_FILES:
         info = hf_hub_download(
             repo_id=MODEL_REPO_ID,
@@ -117,14 +116,10 @@ def get_download_plan() -> DownloadPlan:
         files.append(info)
         if info.will_download:
             total_bytes += info.file_size
-
     return DownloadPlan(files=files, total_bytes=total_bytes)
 
 
-def download_model(
-    progress_callback: ProgressCallback,
-    status_callback: StatusCallback,
-) -> Path:
+def download_model(progress_callback: ProgressCallback, status_callback: StatusCallback) -> Path:
     plan = get_download_plan()
     model_dir = get_model_dir()
     cache_dir = get_hf_cache_dir()
@@ -155,7 +150,7 @@ def download_model(
         HubProgressTqdm.reporter = None
 
     if not is_model_ready(model_dir):
-        raise RuntimeError("모델 다운로드가 끝났지만 필수 파일이 누락되었습니다.")
+        raise RuntimeError("모델 다운로드 후에도 필수 파일이 누락되어 있습니다.")
 
     status_callback("모델 다운로드 완료")
     return model_dir

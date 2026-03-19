@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import ctranslate2
 from faster_whisper import WhisperModel
 
 from .config import MODEL_LANGUAGE
+from .cuda_runtime import add_cuda_runtime_to_path, has_cuda_device, is_cuda_runtime_ready
 from .model_manager import get_model_dir, is_model_ready
 from .srt_writer import SubtitleSegment
 
@@ -22,13 +24,47 @@ class RuntimeConfig:
     label: str
 
 
+def is_cuda_runtime_available() -> tuple[bool, str]:
+    if not has_cuda_device():
+        return False, "CUDA GPU를 찾지 못했습니다."
+
+    add_cuda_runtime_to_path()
+    if not is_cuda_runtime_ready():
+        return False, "CUDA 런타임 다운로드가 필요합니다."
+
+    missing_libraries: list[str] = []
+    for library_name in ("cublas64_12.dll",):
+        try:
+            ctypes.WinDLL(library_name)
+        except OSError:
+            missing_libraries.append(library_name)
+
+    if missing_libraries:
+        return False, f"필수 CUDA 라이브러리 없음: {', '.join(missing_libraries)}"
+    return True, ""
+
+
+def is_cuda_runtime_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        token in lowered
+        for token in (
+            "cublas",
+            "cudnn",
+            "cudart",
+            "cuda",
+            "curand",
+            "cufft",
+            "cannot be loaded",
+            "load library failed",
+        )
+    )
+
+
 def get_available_runtime_choices() -> list[tuple[str, str]]:
     choices = [("cpu", "CPU")]
-    try:
-        if ctranslate2.get_cuda_device_count() > 0:
-            choices.insert(0, ("cuda", "GPU (CUDA)"))
-    except Exception:
-        pass
+    if has_cuda_device():
+        choices.insert(0, ("cuda", "GPU (CUDA)"))
     return choices
 
 
@@ -42,11 +78,9 @@ def get_default_runtime_choice() -> str:
 def build_runtime_config(device: str) -> RuntimeConfig:
     normalized = device.lower().strip()
     if normalized == "cuda":
-        try:
-            if ctranslate2.get_cuda_device_count() <= 0:
-                raise RuntimeError("CUDA GPU를 찾지 못했습니다.")
-        except Exception as exc:
-            raise RuntimeError(f"GPU 사용 불가: {exc}") from exc
+        available, reason = is_cuda_runtime_available()
+        if not available:
+            raise RuntimeError(f"GPU 사용 불가: {reason}")
 
         supported = ctranslate2.get_supported_compute_types("cuda")
         for compute_type in ("float16", "int8_float16", "int8_float32", "float32"):
@@ -93,7 +127,6 @@ class TranscriptionEngine:
             cpu_threads=self.runtime_config.cpu_threads,
             num_workers=1,
         )
-
         return self._model
 
     def get_media_duration(self, source_path: Path) -> float:
@@ -136,13 +169,8 @@ class TranscriptionEngine:
                         last_percent = percent
                         progress_callback(percent, float(segment.end), media_duration)
                 continue
-            result.append(
-                SubtitleSegment(
-                    start=float(segment.start),
-                    end=float(segment.end),
-                    text=text,
-                )
-            )
+
+            result.append(SubtitleSegment(start=float(segment.start), end=float(segment.end), text=text))
             if progress_callback is not None and media_duration > 0:
                 percent = min(100, int(float(segment.end) * 100 / media_duration))
                 if percent != last_percent:
@@ -151,5 +179,4 @@ class TranscriptionEngine:
 
         if progress_callback is not None:
             progress_callback(100, media_duration, media_duration)
-
         return result

@@ -8,7 +8,8 @@ from .config import SUPPORTED_EXTENSIONS
 
 
 STATUS_PENDING = "대기중"
-STATUS_PROCESSING = "처리중"
+STATUS_TRANSCRIBING = "자막 생성중"
+STATUS_TRANSLATING = "번역중"
 STATUS_DONE = "완료"
 STATUS_FAILED = "실패"
 STATUS_SKIPPED = "스킵"
@@ -32,7 +33,6 @@ def normalize_input_files(paths: Iterable[str | Path]) -> tuple[list[QueueItem],
 
     for raw_path in paths:
         path = Path(raw_path).expanduser()
-
         try:
             resolved = path.resolve(strict=False)
         except OSError as exc:
@@ -41,11 +41,9 @@ def normalize_input_files(paths: Iterable[str | Path]) -> tuple[list[QueueItem],
 
         if resolved in seen:
             continue
-
         if resolved.suffix.lower() not in SUPPORTED_EXTENSIONS:
             errors.append(f"지원하지 않는 파일 형식: {resolved}")
             continue
-
         if not resolved.exists() or not resolved.is_file():
             errors.append(f"파일을 찾을 수 없음: {resolved}")
             continue
