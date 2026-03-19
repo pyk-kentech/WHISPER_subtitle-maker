@@ -100,6 +100,14 @@ python -m venv .venv
 
 빌드 결과물은 `dist\DongeumSubMaker` 아래에 생성됩니다.
 
+단일 실행 파일 빌드:
+
+```powershell
+.\build-onefile.ps1
+```
+
+이 경우 `dist\DongeumSubMaker-OneFile.exe`가 생성됩니다.
+
 ## SRT 형식
 
 - 인덱스는 1부터 시작
