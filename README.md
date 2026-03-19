@@ -75,7 +75,7 @@ requirement.txt
 README.md
 ```
 
-## 의존성
+## requirement
 
 - Python 3.11 권장
 - PySide6
