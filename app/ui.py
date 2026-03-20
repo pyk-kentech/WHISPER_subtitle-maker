@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -18,12 +18,16 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
+    QStyle,
+    QSystemTrayIcon,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -106,6 +110,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(1200, 860)
+        self.setMinimumSize(780, 560)
 
         self._auto_download_on_startup = auto_download_on_startup
         self._items: dict[str, QueueItem] = {}
@@ -117,6 +122,9 @@ class MainWindow(QMainWindow):
         self._session_success_count = 0
         self._session_failure_count = 0
         self._session_skipped_count = 0
+        self._allow_close = False
+        self._tray_message_shown = False
+        self.tray_icon: QSystemTrayIcon | None = None
         self._queue_total = 0
         self._queue_processed = 0
         self._current_file_prefix = "현재 파일: 대기 중"
@@ -144,12 +152,13 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.tabs, 1)
 
         self.setCentralWidget(central)
+        self._create_tray_icon()
         self.log("프로그램 시작")
         self.refresh_model_status()
 
     def _build_main_tab(self) -> QWidget:
-        page = QWidget()
-        root_layout = QVBoxLayout(page)
+        content = QWidget()
+        root_layout = QVBoxLayout(content)
         root_layout.setSpacing(10)
 
         runtime_row = QHBoxLayout()
@@ -255,11 +264,84 @@ class MainWindow(QMainWindow):
         self.queue_progress.setStyleSheet(GREEN_BAR_STYLE)
         root_layout.addWidget(self.queue_progress)
 
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(content)
+
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.addWidget(scroll)
         return page
 
+    def _create_tray_icon(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        tray_menu = QMenu(self)
+
+        show_action = QAction("Show Window", self)
+        show_action.triggered.connect(self.restore_from_tray)
+        tray_menu.addAction(show_action)
+
+        hide_action = QAction("Hide to Tray", self)
+        hide_action.triggered.connect(self.hide_to_tray)
+        tray_menu.addAction(hide_action)
+
+        tray_menu.addSeparator()
+
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.quit_from_tray)
+        tray_menu.addAction(quit_action)
+
+        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        self.tray_icon = QSystemTrayIcon(icon, self)
+        self.tray_icon.setToolTip(APP_NAME)
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def hide_to_tray(self) -> None:
+        self.hide()
+        if self.tray_icon is not None and not self._tray_message_shown:
+            self.tray_icon.showMessage(
+                APP_NAME,
+                "The app keeps running in the system tray.",
+                QSystemTrayIcon.Information,
+                3000,
+            )
+            self._tray_message_shown = True
+
+    def restore_from_tray(self) -> None:
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick}:
+            if self.isVisible():
+                self.hide_to_tray()
+            else:
+                self.restore_from_tray()
+
+    def quit_from_tray(self) -> None:
+        self._allow_close = True
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
+        self.close()
+
+    def changeEvent(self, event) -> None:
+        if event.type() == event.Type.WindowStateChange and self.isMinimized():
+            self.hide_to_tray()
+            event.ignore()
+            return
+        super().changeEvent(event)
+
     def _build_translation_tab(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setSpacing(10)
 
         api_box = QGroupBox("API 키")
@@ -322,9 +404,28 @@ class MainWindow(QMainWindow):
         prompt_layout.addWidget(self.note_edit)
         layout.addWidget(prompt_box, 1)
 
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(content)
+
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.addWidget(scroll)
         return page
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._allow_close:
+            super().closeEvent(event)
+            return
+
+        if self.tray_icon is not None:
+            self.hide_to_tray()
+            event.ignore()
+            return
+
         if self.is_busy():
             QMessageBox.warning(self, APP_NAME, "다운로드 또는 작업이 진행 중입니다.")
             event.ignore()
