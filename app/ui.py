@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -24,14 +24,17 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedLayout,
     QStyle,
     QSystemTrayIcon,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -66,6 +69,40 @@ QProgressBar::chunk {
 }
 """
 
+DROP_AREA_BASE_STYLE = (
+    "#dropArea {"
+    "border: 2px dashed #6a7b8c;"
+    "border-radius: 10px;"
+    "background: #f5f8fb;"
+    "}"
+)
+
+DROP_AREA_ACTIVE_STYLE = (
+    "#dropArea {"
+    "border: 2px solid #2f9e44;"
+    "border-radius: 10px;"
+    "background: #eaf7ee;"
+    "}"
+)
+
+DROP_TABLE_BASE_STYLE = (
+    "QTableWidget {"
+    "border: 1px solid #c9d4df;"
+    "border-radius: 8px;"
+    "background: #ffffff;"
+    "gridline-color: #dde5ee;"
+    "}"
+)
+
+DROP_TABLE_ACTIVE_STYLE = (
+    "QTableWidget {"
+    "border: 2px solid #2f9e44;"
+    "border-radius: 8px;"
+    "background: #eef9f1;"
+    "gridline-color: #dde5ee;"
+    "}"
+)
+
 
 class DropArea(QFrame):
     files_dropped = Signal(list)
@@ -86,23 +123,94 @@ class DropArea(QFrame):
         layout = QVBoxLayout(self)
         label = QLabel("여기에 .mp3 / .mp4 파일을 드래그 앤 드롭")
         label.setAlignment(Qt.AlignCenter)
-        label.setMinimumHeight(90)
+        label.setMinimumHeight(220)
+        label.setWordWrap(True)
+        label.setStyleSheet("font-size: 18px; font-weight: 600; color: #31455a;")
         layout.addWidget(label)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
+            self.setStyleSheet(DROP_AREA_ACTIVE_STYLE)
             event.acceptProposedAction()
             return
         event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:
+        self.setStyleSheet(DROP_AREA_BASE_STYLE)
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event: QDropEvent) -> None:
         paths: list[str] = []
         for url in event.mimeData().urls():
             if url.isLocalFile():
                 paths.append(url.toLocalFile())
+        self.setStyleSheet(DROP_AREA_BASE_STYLE)
         if paths:
             self.files_dropped.emit(paths)
         event.acceptProposedAction()
+
+
+class DropTableWidget(QTableWidget):
+    files_dropped = Signal(list)
+
+    def __init__(self, rows: int, columns: int) -> None:
+        super().__init__(rows, columns)
+        self.setAcceptDrops(True)
+        self.setStyleSheet(DROP_TABLE_BASE_STYLE)
+        self.setWordWrap(False)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            self.setStyleSheet(DROP_TABLE_ACTIVE_STYLE)
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:
+        self.setStyleSheet(DROP_TABLE_BASE_STYLE)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths: list[str] = []
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                paths.append(url.toLocalFile())
+        self.setStyleSheet(DROP_TABLE_BASE_STYLE)
+        if paths:
+            self.files_dropped.emit(paths)
+        event.acceptProposedAction()
+
+
+class CollapsibleSection(QWidget):
+    def __init__(self, title: str, content: QWidget, expanded: bool = True, parent=None) -> None:
+        super().__init__(parent)
+        self.toggle_button = QToolButton()
+        self.toggle_button.setText(title)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(expanded)
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle_button.clicked.connect(self._toggle)
+        self.toggle_button.setStyleSheet("font-weight: 600; padding: 6px 0;")
+
+        self.content = content
+        self.content.setVisible(expanded)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self.toggle_button)
+        layout.addWidget(self.content)
+
+    def _toggle(self, checked: bool) -> None:
+        self.toggle_button.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self.content.setVisible(checked)
 
 
 class MainWindow(QMainWindow):
@@ -132,6 +240,8 @@ class MainWindow(QMainWindow):
         self._stage_detail = ""
 
         self._translator_settings = load_translator_settings()
+        self._saved_api_keys_text = "\n".join(load_api_keys())
+        self._settings_dirty = False
 
         central = QWidget()
         root_layout = QVBoxLayout(central)
@@ -190,10 +300,6 @@ class MainWindow(QMainWindow):
         self.model_progress.setStyleSheet(GREEN_BAR_STYLE)
         root_layout.addWidget(self.model_progress)
 
-        self.drop_area = DropArea()
-        self.drop_area.files_dropped.connect(self.add_files)
-        root_layout.addWidget(self.drop_area)
-
         button_row = QHBoxLayout()
         self.add_button = QPushButton("파일 추가")
         self.add_button.clicked.connect(self.open_file_dialog)
@@ -216,7 +322,11 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Vertical)
         root_layout.addWidget(splitter, 1)
 
-        self.table = QTableWidget(0, 3)
+        self.drop_area = DropArea()
+        self.drop_area.files_dropped.connect(self.add_files)
+
+        self.table = DropTableWidget(0, 3)
+        self.table.files_dropped.connect(self.add_files)
         self.table.setHorizontalHeaderLabels(["파일명", "전체 경로", "상태"])
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -226,7 +336,17 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setAlternatingRowColors(True)
-        splitter.addWidget(self.table)
+        self.table.setTextElideMode(Qt.ElideMiddle)
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.table.setShowGrid(False)
+
+        self.list_stack_host = QWidget()
+        self.list_stack = QStackedLayout(self.list_stack_host)
+        self.list_stack.setContentsMargins(0, 0, 0, 0)
+        self.list_stack.addWidget(self.drop_area)
+        self.list_stack.addWidget(self.table)
+        self.list_stack.setCurrentWidget(self.drop_area)
+        splitter.addWidget(self.list_stack_host)
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -344,65 +464,76 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(content)
         layout.setSpacing(10)
 
+        save_row = QHBoxLayout()
+        self.translation_settings_status = QLabel("")
+        self.translation_settings_status.setStyleSheet("color: #2f6f3e;")
+        save_row.addWidget(self.translation_settings_status)
+        save_row.addStretch(1)
+        self.save_translation_button = QPushButton("저장")
+        self.save_translation_button.setEnabled(False)
+        self.save_translation_button.clicked.connect(self.save_translation_inputs)
+        save_row.addWidget(self.save_translation_button)
+        layout.addLayout(save_row)
+
         api_box = QGroupBox("API 키")
         api_layout = QVBoxLayout(api_box)
         api_layout.addWidget(QLabel("여러 키를 한 줄에 하나씩 입력하면 자동 저장됩니다."))
-        self.keys_edit = QPlainTextEdit("\n".join(load_api_keys()))
+        self.keys_edit = QPlainTextEdit(self._saved_api_keys_text)
         self.keys_edit.setPlaceholderText("AIza...")
         self.keys_edit.setMinimumHeight(140)
-        self.keys_edit.textChanged.connect(self.save_translation_inputs)
+        self.keys_edit.textChanged.connect(self.mark_translation_inputs_dirty)
         api_layout.addWidget(self.keys_edit)
-        layout.addWidget(api_box)
+        layout.addWidget(CollapsibleSection("API Keys", api_box, expanded=True))
 
         option_box = QGroupBox("Gemini 번역 옵션")
         form = QFormLayout(option_box)
 
         self.model_edit = QLineEdit(self._translator_settings.preferred_model)
         self.model_edit.setPlaceholderText("비우면 자동 모델 순서 사용")
-        self.model_edit.textChanged.connect(self.save_translation_inputs)
+        self.model_edit.textChanged.connect(self.mark_translation_inputs_dirty)
         form.addRow("모델 지정", self.model_edit)
 
         self.chunk_size_spin = QSpinBox()
         self.chunk_size_spin.setRange(10, 200)
         self.chunk_size_spin.setValue(self._translator_settings.chunk_size)
-        self.chunk_size_spin.valueChanged.connect(self.save_translation_inputs)
+        self.chunk_size_spin.valueChanged.connect(self.mark_translation_inputs_dirty)
         form.addRow("청크 크기", self.chunk_size_spin)
 
         self.reasoning_combo = QComboBox()
         self.reasoning_combo.addItems(["minimal", "low", "medium", "high"])
         self.reasoning_combo.setCurrentText(self._translator_settings.reasoning_level)
-        self.reasoning_combo.currentTextChanged.connect(self.save_translation_inputs)
+        self.reasoning_combo.currentTextChanged.connect(self.mark_translation_inputs_dirty)
         form.addRow("추론 레벨", self.reasoning_combo)
 
         self.temperature_spin = QDoubleSpinBox()
         self.temperature_spin.setRange(0.0, 2.0)
         self.temperature_spin.setSingleStep(0.1)
         self.temperature_spin.setValue(self._translator_settings.temperature)
-        self.temperature_spin.valueChanged.connect(self.save_translation_inputs)
+        self.temperature_spin.valueChanged.connect(self.mark_translation_inputs_dirty)
         form.addRow("온도", self.temperature_spin)
 
         self.top_p_spin = QDoubleSpinBox()
         self.top_p_spin.setRange(0.0, 1.0)
         self.top_p_spin.setSingleStep(0.05)
         self.top_p_spin.setValue(self._translator_settings.top_p)
-        self.top_p_spin.valueChanged.connect(self.save_translation_inputs)
+        self.top_p_spin.valueChanged.connect(self.mark_translation_inputs_dirty)
         form.addRow("Top-P", self.top_p_spin)
-        layout.addWidget(option_box)
+        layout.addWidget(CollapsibleSection("Gemini Translation Options", option_box, expanded=True))
 
         prompt_box = QGroupBox("프롬프트")
         prompt_layout = QVBoxLayout(prompt_box)
         prompt_layout.addWidget(QLabel("시스템 프롬프트"))
         self.system_prompt_edit = QPlainTextEdit(self._translator_settings.system_prompt)
         self.system_prompt_edit.setMinimumHeight(240)
-        self.system_prompt_edit.textChanged.connect(self.save_translation_inputs)
+        self.system_prompt_edit.textChanged.connect(self.mark_translation_inputs_dirty)
         prompt_layout.addWidget(self.system_prompt_edit)
 
         prompt_layout.addWidget(QLabel("번역 노트"))
         self.note_edit = QPlainTextEdit(self._translator_settings.translation_note)
         self.note_edit.setMinimumHeight(140)
-        self.note_edit.textChanged.connect(self.save_translation_inputs)
+        self.note_edit.textChanged.connect(self.mark_translation_inputs_dirty)
         prompt_layout.addWidget(self.note_edit)
-        layout.addWidget(prompt_box, 1)
+        layout.addWidget(CollapsibleSection("Prompts", prompt_box, expanded=True), 1)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -463,7 +594,7 @@ class MainWindow(QMainWindow):
     def current_runtime_device(self) -> str:
         return str(self.runtime_combo.currentData() or "cpu")
 
-    def translator_settings(self) -> TranslatorSettings:
+    def collect_translation_inputs(self) -> TranslatorSettings:
         return TranslatorSettings(
             preferred_model=self.model_edit.text().strip(),
             chunk_size=self.chunk_size_spin.value(),
@@ -474,9 +605,51 @@ class MainWindow(QMainWindow):
             translation_note=self.note_edit.toPlainText(),
         )
 
+    def translator_settings(self) -> TranslatorSettings:
+        return self._translator_settings
+
+    def mark_translation_inputs_dirty(self) -> None:
+        self._settings_dirty = True
+        self.sync_translation_save_state()
+        self.translation_settings_status.setText("저장되지 않은 변경사항")
+
     def save_translation_inputs(self) -> None:
-        save_api_keys(self.keys_edit.toPlainText())
-        save_translator_settings(self.translator_settings())
+        self._saved_api_keys_text = self.keys_edit.toPlainText()
+        self._translator_settings = self.collect_translation_inputs()
+        save_api_keys(self._saved_api_keys_text)
+        save_translator_settings(self._translator_settings)
+        self._settings_dirty = False
+        self.sync_translation_save_state()
+        self.translation_settings_status.setText("설정이 저장되었습니다")
+        self.log("번역 설정이 저장되었습니다")
+
+    def update_file_area_mode(self) -> None:
+        if getattr(self, "list_stack", None) is None:
+            return
+        target = self.drop_area if self.table.rowCount() == 0 else self.table
+        self.list_stack.setCurrentWidget(target)
+
+    def update_row_appearance(self, row: int, status: str) -> None:
+        color = None
+        if status in {STATUS_TRANSCRIBING, STATUS_TRANSLATING}:
+            color = QColor("#e8f2ff")
+        elif status == STATUS_DONE:
+            color = QColor("#e7f7ea")
+        elif status == STATUS_FAILED:
+            color = QColor("#fdeaea")
+        elif status == STATUS_SKIPPED:
+            color = QColor("#f7f3e8")
+
+        for column in range(self.table.columnCount()):
+            item = self.table.item(row, column)
+            if item is None:
+                continue
+            item.setBackground(color if color is not None else QColor("#ffffff"))
+
+    def sync_translation_save_state(self) -> None:
+        if not hasattr(self, "save_translation_button"):
+            return
+        self.save_translation_button.setEnabled(self._settings_dirty)
 
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -514,6 +687,7 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(self._model_ready and has_pending and enabled)
         self.retry_download_button.setEnabled(not download_running and not self._model_ready)
         self.tabs.setTabEnabled(1, True)
+        self.sync_translation_save_state()
 
     def open_file_dialog(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -539,9 +713,16 @@ class MainWindow(QMainWindow):
 
             row = self.table.rowCount()
             self.table.insertRow(row)
-            self.table.setItem(row, 0, QTableWidgetItem(item.source_path.name))
-            self.table.setItem(row, 1, QTableWidgetItem(str(item.source_path)))
-            self.table.setItem(row, 2, QTableWidgetItem(item.status))
+            name_item = QTableWidgetItem(item.source_path.name)
+            name_item.setToolTip(str(item.source_path))
+            path_item = QTableWidgetItem(str(item.source_path))
+            path_item.setToolTip(str(item.source_path))
+            status_item = QTableWidgetItem(item.status)
+            status_item.setToolTip(item.status)
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, path_item)
+            self.table.setItem(row, 2, status_item)
+            self.update_row_appearance(row, item.status)
             self._items[key] = item
             self._rows_by_path[key] = row
             added_count += 1
@@ -551,6 +732,7 @@ class MainWindow(QMainWindow):
             if self._processing:
                 self.log("진행 중에 추가된 파일은 현재 작업이 끝난 뒤 자동으로 이어서 처리합니다.")
             self.refresh_queue_progress()
+            self.update_file_area_mode()
         self.update_controls()
 
     def _rebuild_row_index(self) -> None:
@@ -578,6 +760,7 @@ class MainWindow(QMainWindow):
 
         self._rebuild_row_index()
         self.refresh_queue_progress()
+        self.update_file_area_mode()
         self.update_controls()
         return len(rows_to_remove)
 
@@ -614,6 +797,8 @@ class MainWindow(QMainWindow):
             status_item = QTableWidgetItem()
             self.table.setItem(row, 2, status_item)
         status_item.setText(status_text)
+        status_item.setToolTip(status_text)
+        self.update_row_appearance(row, status)
 
         if status == STATUS_DONE:
             removed_count = self._remove_paths([source_path])
@@ -648,7 +833,6 @@ class MainWindow(QMainWindow):
         self.update_controls()
 
     def start_pipeline(self) -> None:
-        self.save_translation_inputs()
         api_keys = load_api_keys()
         if not api_keys:
             self.tabs.setCurrentIndex(1)
