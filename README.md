@@ -19,7 +19,7 @@
 ## 폴더 구조
 
 ```text
-Dongeum sub maker/
+WHISPER_subtitle-maker/
   app/
     config.py
     file_queue.py
@@ -45,8 +45,11 @@ Dongeum sub maker/
 
 ## 실행 방법
 
-```powershell
-cd "d:\PotPlayer\Dongeum sub maker"
+## 코드 받는 방법
+git clone https://github.com/pyk-kentech/WHISPER_subtitle-maker.git
+
+## powershell
+cd WHISPER_subtitle-maker
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 .\.venv\Scripts\python -m app.main
@@ -54,11 +57,17 @@ python -m venv .venv
 
 최초 실행 시 모델이 자동 다운로드됩니다. 다운로드가 완료되기 전까지는 변환 시작 버튼이 비활성화됩니다.
 
-## 빌드 방법
+## 빌드 방법(exe 만들기)
 
 ```powershell
-cd "d:\PotPlayer\Dongeum sub maker"
+cd WHISPER_subtitle-maker
 .\build.ps1
+```
+## 원빌드 방법(단일 exe 만들기)
+
+```powershell
+cd WHISPER_subtitle-maker
+.\build-onefile.ps1
 ```
 
 빌드 결과물은 `dist\DongeumSubMaker` 아래에 생성됩니다. `--windowed` 옵션으로 콘솔 없이 실행되는 Windows GUI EXE를 기준으로 구성했습니다.
