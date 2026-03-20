@@ -93,6 +93,9 @@ python -m venv .venv
 .\build-onefile.ps1
 ```
 
+빌드할때 WHISPER_subtitle-maker 폴더 안에 .ico 파일을 넣는다면, 자동으로 그 아이콘을 프로그램 아이콘으로 사용합니다.
+
+
 📌 결과물 위치:
 
 ```
