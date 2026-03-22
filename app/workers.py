@@ -1,5 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import queue
+import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -7,13 +10,30 @@ from PySide6.QtCore import QThread, Signal
 
 from .cuda_runtime import ensure_cuda_runtime
 from .dictionary_pack import ensure_dictionary_pack
-from .file_queue import STATUS_DONE, STATUS_FAILED, STATUS_PENDING, STATUS_SKIPPED, STATUS_TRANSCRIBING, STATUS_TRANSLATING
+from .file_queue import (
+    STATUS_DONE,
+    STATUS_FAILED,
+    STATUS_PAUSED,
+    STATUS_PENDING,
+    STATUS_REMOVED,
+    STATUS_SAVING,
+    STATUS_SKIPPED,
+    STATUS_TRANSCRIBING,
+    STATUS_TRANSLATING,
+)
 from .gemini_translator import GeminiTranslator, TranslationConfig
 from .japanese_postprocess import PostprocessOptions, postprocess_japanese_segments
 from .model_manager import download_model, get_download_plan, get_model_dir, is_model_ready
-from .srt_writer import build_srt_text, write_srt
+from .srt_writer import build_srt_text, write_srt_text
 from .subtitle_document import load_subtitle_document_from_text
-from .transcriber import TranscriptionEngine, build_runtime_config, is_cuda_runtime_error
+from .transcriber import (
+    RuntimeTuningOptions,
+    TranscriptionEngine,
+    VADSettings,
+    build_runtime_config,
+    is_cuda_runtime_error,
+    unload_loaded_models,
+)
 from .translator_store import TranslatorSettings
 
 
@@ -29,14 +49,29 @@ def format_bytes(size: int) -> str:
     return f"{size} B"
 
 
+class PauseRequested(Exception):
+    pass
+
+
 @dataclass(slots=True)
 class PipelineJob:
     source_paths: list[str]
     runtime_device: str
+    model_key: str
+    source_language: str
+    runtime_tuning: RuntimeTuningOptions
+    vad_settings: VADSettings
     enable_postprocess: bool
     enable_enhanced_postprocess: bool
     translator_settings: TranslatorSettings
     api_keys: list[str]
+
+
+@dataclass(slots=True)
+class SaveTask:
+    source_path: str
+    output_path: Path
+    content: str
 
 
 class ModelDownloadWorker(QThread):
@@ -46,19 +81,23 @@ class ModelDownloadWorker(QThread):
     finished_success = Signal(str)
     failed = Signal(str)
 
+    def __init__(self, model_key: str, parent=None) -> None:
+        super().__init__(parent)
+        self.model_key = model_key
+
     def run(self) -> None:
         try:
-            if is_model_ready():
+            if is_model_ready(model_key=self.model_key):
                 self.progress_changed.emit(100)
                 self.status_changed.emit("모델 캐시 준비 완료")
-                self.finished_success.emit(str(get_model_dir()))
+                self.finished_success.emit(str(get_model_dir(self.model_key)))
                 return
 
-            plan = get_download_plan()
+            plan = get_download_plan(self.model_key)
             if plan.total_bytes > 0:
                 self.log_message.emit(f"모델 다운로드 필요: {format_bytes(plan.total_bytes)}")
             else:
-                self.log_message.emit("모델 캐시를 확인하는 중입니다.")
+                self.log_message.emit("모델 캐시 상태를 확인하는 중입니다.")
 
             def on_progress(downloaded_bytes: int, total_bytes: int, filename: str, file_downloaded: int, file_total: int) -> None:
                 percent = 100 if total_bytes <= 0 else min(100, int(downloaded_bytes * 100 / total_bytes))
@@ -72,7 +111,7 @@ class ModelDownloadWorker(QThread):
                 self.status_changed.emit(message)
                 self.log_message.emit(message)
 
-            model_dir = download_model(on_progress, on_status)
+            model_dir = download_model(self.model_key, on_progress, on_status)
             self.progress_changed.emit(100)
             self.finished_success.emit(str(model_dir))
         except Exception as exc:
@@ -89,46 +128,119 @@ class PipelineWorker(QThread):
     translation_progress_changed = Signal(int, int, str, str, int)
     summary_ready = Signal(int, int, int)
     failed = Signal(str)
+    processing_state_changed = Signal(str, str)
 
     def __init__(self, job: PipelineJob, parent=None) -> None:
         super().__init__(parent)
         self.job = job
+        self._condition = threading.Condition()
+        self._pending_paths = deque(job.source_paths)
+        self._queued_paths = set(job.source_paths)
+        self._current_path: str | None = None
+        self._pause_requested = False
+        self._stop_requested = False
+        self._processed = 0
+        self._success_count = 0
+        self._failure_count = 0
+        self._skipped_count = 0
+        self._counter_lock = threading.Lock()
+        self._save_queue: queue.Queue[SaveTask | None] = queue.Queue()
+        self._save_thread: threading.Thread | None = None
+
+    @property
+    def current_path(self) -> str | None:
+        with self._condition:
+            return self._current_path
+
+    def add_paths(self, paths: list[str]) -> int:
+        added = 0
+        with self._condition:
+            for path in paths:
+                if path in self._queued_paths or path == self._current_path:
+                    continue
+                self._pending_paths.append(path)
+                self._queued_paths.add(path)
+                added += 1
+            total = self._processed + len(self._pending_paths) + (1 if self._current_path else 0)
+            self._condition.notify_all()
+        if added:
+            self.queue_progress_changed.emit(self._processed, total)
+        return added
+
+    def remove_paths(self, paths: list[str]) -> tuple[list[str], list[str]]:
+        removed: list[str] = []
+        blocked: list[str] = []
+        with self._condition:
+            pending_list = list(self._pending_paths)
+            keep: list[str] = []
+            for path in pending_list:
+                if path in paths:
+                    removed.append(path)
+                    self._queued_paths.discard(path)
+                else:
+                    keep.append(path)
+            for path in paths:
+                if path == self._current_path:
+                    blocked.append(path)
+            self._pending_paths = deque(keep)
+            total = self._processed + len(self._pending_paths) + (1 if self._current_path else 0)
+            self._condition.notify_all()
+        for path in removed:
+            self.item_status_changed.emit(path, STATUS_REMOVED, "대기열에서 제거됨")
+        if removed:
+            self.queue_progress_changed.emit(self._processed, total)
+        return removed, blocked
+
+    def pause_processing(self) -> bool:
+        with self._condition:
+            if self._pause_requested:
+                return False
+            self._pause_requested = True
+            self._condition.notify_all()
+        self.processing_state_changed.emit(STATUS_PAUSED, "현재 파일 마무리 후 일시 중지합니다.")
+        return True
+
+    def resume_processing(self) -> bool:
+        with self._condition:
+            if not self._pause_requested:
+                return False
+            self._pause_requested = False
+            self._condition.notify_all()
+        self.processing_state_changed.emit(STATUS_PENDING, "남은 대기열 처리를 재개합니다.")
+        return True
 
     def run(self) -> None:
         try:
-            total = len(self.job.source_paths)
-            success_count = 0
-            failure_count = 0
-            skipped_count = 0
-            processed = 0
-
+            self._start_save_worker()
             if self.job.runtime_device == "cuda":
-                self.stage_changed.emit("환경 준비", "CUDA 런타임 확인")
+                self.stage_changed.emit("환경 준비", "CUDA runtime 확인")
                 ensure_cuda_runtime(self._report_runtime_progress, self.log_message.emit)
 
             if self.job.enable_enhanced_postprocess:
-                self.stage_changed.emit("환경 준비", "강화 후처리 사전팩 확인")
+                self.stage_changed.emit("환경 준비", "강화 후처리 사전 확인")
                 ensure_dictionary_pack(self._report_dictionary_progress, self.log_message.emit)
 
             if not self.job.api_keys:
-                raise RuntimeError("번역용 Gemini API 키가 비어 있습니다. 번역 설정 탭에서 키를 입력하세요.")
+                raise RuntimeError("번역용 Gemini API 키가 비어 있습니다. 번역 설정 탭에서 입력하세요.")
 
             translator = GeminiTranslator(
                 TranslationConfig(
                     keys=self.job.api_keys,
                     preferred_model=self.job.translator_settings.preferred_model,
+                    target_language=self.job.translator_settings.target_language,
                     system_prompt=self.job.translator_settings.system_prompt,
                     translation_note=self.job.translator_settings.translation_note,
                     temperature=self.job.translator_settings.temperature,
                     top_p=self.job.translator_settings.top_p,
                     reasoning_level=self.job.translator_settings.reasoning_level,
                     chunk_size=self.job.translator_settings.chunk_size,
+                    request_delay_seconds=self.job.translator_settings.request_delay_seconds,
                 ),
                 self.log_message.emit,
             )
 
-            runtime_config = build_runtime_config(self.job.runtime_device)
-            engine = TranscriptionEngine(runtime_config)
+            runtime_config = build_runtime_config(self.job.runtime_device, self.job.runtime_tuning)
+            engine = TranscriptionEngine(runtime_config, self.job.model_key)
             self.log_message.emit(f"실행 장치: {runtime_config.label}")
 
             postprocess_options = PostprocessOptions(
@@ -141,7 +253,11 @@ class PipelineWorker(QThread):
                 one_word=True,
             )
 
-            for index, source_str in enumerate(self.job.source_paths, start=1):
+            while True:
+                source_str, index, total = self._next_source()
+                if source_str is None:
+                    break
+
                 source_path = Path(source_str)
                 output_path = source_path.with_suffix(".srt")
                 self.file_started.emit(index, total, str(source_path))
@@ -153,68 +269,158 @@ class PipelineWorker(QThread):
                         raise FileNotFoundError("입력 파일을 찾을 수 없습니다.")
 
                     if output_path.exists():
-                        skipped_count += 1
+                        with self._counter_lock:
+                            self._skipped_count += 1
                         message = "기존 자막 파일 존재 -> 스킵"
                         self.item_status_changed.emit(source_str, STATUS_SKIPPED, message)
                         self.log_message.emit(f"{source_path} | {message}")
-                        self.stage_changed.emit("스킵", "기존 한국어 자막 존재")
+                        self.stage_changed.emit("스킵", "기존 자막 파일 존재")
                         self.stage_progress_changed.emit(100, 0.0, 0.0)
                         continue
 
                     self.item_status_changed.emit(source_str, STATUS_TRANSCRIBING, "")
-                    self.stage_changed.emit("자막 생성", "일본어 음성 인식")
+                    self.stage_changed.emit("자막 생성", "음성 인식")
 
+                    language_code = None if self.job.source_language == "auto" else self.job.source_language
                     try:
-                        segments = engine.transcribe_file(source_path, self.stage_progress_changed.emit)
+                        segments = engine.transcribe_file(
+                            source_path,
+                            self._make_stage_progress_callback(),
+                            language_code=language_code,
+                            vad_settings=self.job.vad_settings,
+                        )
                     except Exception as exc:
                         if runtime_config.device == "cuda" and is_cuda_runtime_error(str(exc)):
-                            self.log_message.emit(
-                                "GPU 초기화에 실패하여 CPU로 자동 전환합니다. CUDA 런타임 설치 상태를 확인하세요."
+                            self.log_message.emit("GPU 초기화에 실패하여 CPU로 자동 전환합니다.")
+                            runtime_config = build_runtime_config(
+                                "cpu",
+                                RuntimeTuningOptions(
+                                    compute_type="auto",
+                                    cpu_threads=self.job.runtime_tuning.cpu_threads,
+                                    num_workers=self.job.runtime_tuning.num_workers,
+                                    auto_unload_after_job=self.job.runtime_tuning.auto_unload_after_job,
+                                ),
                             )
-                            runtime_config = build_runtime_config("cpu")
-                            engine = TranscriptionEngine(runtime_config)
+                            engine = TranscriptionEngine(runtime_config, self.job.model_key)
                             self.log_message.emit(f"자동 전환된 실행 장치: {runtime_config.label}")
-                            segments = engine.transcribe_file(source_path, self.stage_progress_changed.emit)
+                            segments = engine.transcribe_file(
+                                source_path,
+                                self._make_stage_progress_callback(),
+                                language_code=language_code,
+                                vad_settings=self.job.vad_settings,
+                            )
                         else:
                             raise
 
+                    self._pause_checkpoint("현재 파일 일시 중지됨")
+
                     if self.job.enable_postprocess:
-                        self.stage_changed.emit("자막 생성", "일본어 후처리")
+                        self.stage_changed.emit("자막 생성", "후처리")
                         segments = postprocess_japanese_segments(segments, postprocess_options)
 
-                    japanese_srt_text = build_srt_text(segments)
-                    if not japanese_srt_text:
-                        raise RuntimeError("일본어 자막 생성 결과가 비어 있습니다.")
+                    subtitle_text = build_srt_text(segments)
+                    if not subtitle_text:
+                        raise RuntimeError("자막 생성 결과가 비어 있습니다.")
 
                     self.item_status_changed.emit(source_str, STATUS_TRANSLATING, "")
-                    self.stage_changed.emit("번역", "한국어 번역")
-                    document = load_subtitle_document_from_text(".srt", japanese_srt_text)
+                    self.stage_changed.emit("번역", "자막 번역")
+                    document = load_subtitle_document_from_text(".srt", subtitle_text)
                     translated = translator.translate_lines(
                         document.get_translatable_records(),
-                        self.translation_progress_changed.emit,
+                        self._make_translation_progress_callback(),
                         source_path.name,
                     )
+                    self._pause_checkpoint("현재 파일 일시 중지됨")
                     document.apply_translations(translated)
-                    output_path.write_text(document.render() + "\n", encoding="utf-8-sig")
-
-                    success_count += 1
-                    self.item_status_changed.emit(source_str, STATUS_DONE, str(output_path))
-                    self.log_message.emit(f"{source_path} | 완료 -> {output_path}")
-                    self.stage_changed.emit("완료", "한국어 자막 저장 완료")
+                    self.item_status_changed.emit(source_str, STATUS_SAVING, str(output_path))
+                    self._enqueue_save(
+                        SaveTask(
+                            source_path=source_str,
+                            output_path=output_path,
+                            content=document.render() + "\n",
+                        )
+                    )
+                    self.log_message.emit(f"{source_path} | 저장 큐 등록 -> {output_path}")
+                    self.stage_changed.emit("저장", "자막 저장 큐 등록")
                     self.stage_progress_changed.emit(100, 0.0, 0.0)
+                except PauseRequested:
+                    self.item_status_changed.emit(source_str, STATUS_PENDING, "일시 중지됨")
+                    self._requeue_current(source_str)
+                    self.processing_state_changed.emit(STATUS_PAUSED, "현재 파일 일시 중지됨")
                 except Exception as exc:
-                    failure_count += 1
+                    with self._counter_lock:
+                        self._failure_count += 1
                     message = str(exc) or exc.__class__.__name__
                     self.item_status_changed.emit(source_str, STATUS_FAILED, message)
                     self.log_message.emit(f"{source_path} | 실패 -> {message}")
                     self.stage_changed.emit("실패", message)
                 finally:
-                    processed += 1
-                    self.queue_progress_changed.emit(processed, total)
+                    self._complete_current()
 
-            self.summary_ready.emit(success_count, failure_count, skipped_count)
+            self._wait_for_save_completion()
+            if self.job.runtime_tuning.auto_unload_after_job:
+                unloaded = unload_loaded_models(self.job.model_key)
+                if unloaded > 0:
+                    self.log_message.emit(f"작업 완료 후 모델 {unloaded}개를 메모리에서 자동 해제했습니다.")
+            self.summary_ready.emit(self._success_count, self._failure_count, self._skipped_count)
         except Exception as exc:
+            self._wait_for_save_completion()
+            if self.job.runtime_tuning.auto_unload_after_job:
+                unload_loaded_models(self.job.model_key)
             self.failed.emit(str(exc) or exc.__class__.__name__)
+
+    def _next_source(self) -> tuple[str | None, int, int]:
+        with self._condition:
+            while True:
+                while self._pause_requested:
+                    self.processing_state_changed.emit(STATUS_PAUSED, "일시 중지됨")
+                    self._condition.wait()
+
+                if self._stop_requested:
+                    return None, self._processed, self._processed
+
+                if self._pending_paths:
+                    source_str = self._pending_paths.popleft()
+                    self._current_path = source_str
+                    total = self._processed + len(self._pending_paths) + 1
+                    index = self._processed + 1
+                    self.processing_state_changed.emit(STATUS_TRANSCRIBING, "처리 중")
+                    return source_str, index, total
+
+                return None, self._processed, self._processed
+
+    def _complete_current(self) -> None:
+        with self._condition:
+            if self._current_path is not None:
+                self._queued_paths.discard(self._current_path)
+                self._current_path = None
+                self._processed += 1
+            total = self._processed + len(self._pending_paths)
+        self.queue_progress_changed.emit(self._processed, total)
+
+    def _requeue_current(self, source_str: str) -> None:
+        with self._condition:
+            self._pending_paths.appendleft(source_str)
+
+    def _pause_checkpoint(self, detail: str) -> None:
+        with self._condition:
+            while self._pause_requested:
+                self.processing_state_changed.emit(STATUS_PAUSED, detail)
+                self._condition.wait()
+
+    def _make_stage_progress_callback(self):
+        def callback(percent: int, current: float, total: float) -> None:
+            self._pause_checkpoint("현재 파일 일시 중지됨")
+            self.stage_progress_changed.emit(percent, current, total)
+
+        return callback
+
+    def _make_translation_progress_callback(self):
+        def callback(chunk_index: int, chunk_total: int, key_display: str, model_name: str, error_count: int) -> None:
+            self._pause_checkpoint("현재 파일 일시 중지됨")
+            self.translation_progress_changed.emit(chunk_index, chunk_total, key_display, model_name, error_count)
+
+        return callback
 
     def _report_runtime_progress(
         self,
@@ -224,7 +430,7 @@ class PipelineWorker(QThread):
         file_downloaded: int,
         file_total: int,
     ) -> None:
-        self._emit_prep_progress("CUDA 런타임", downloaded_bytes, total_bytes, filename, file_downloaded, file_total)
+        self._emit_prep_progress("CUDA runtime", downloaded_bytes, total_bytes, filename, file_downloaded, file_total)
 
     def _report_dictionary_progress(
         self,
@@ -234,7 +440,7 @@ class PipelineWorker(QThread):
         file_downloaded: int,
         file_total: int,
     ) -> None:
-        self._emit_prep_progress("일본어 사전팩", downloaded_bytes, total_bytes, filename, file_downloaded, file_total)
+        self._emit_prep_progress("Japanese dictionary pack", downloaded_bytes, total_bytes, filename, file_downloaded, file_total)
 
     def _emit_prep_progress(
         self,
@@ -254,5 +460,43 @@ class PipelineWorker(QThread):
                 percent = 100
             self.stage_progress_changed.emit(percent, 0.0, 0.0)
             self.log_message.emit(
-                f"{label} 다운로드 {percent}% | {filename} ({format_bytes(file_downloaded)}/{format_bytes(file_total)})"
+                f"{label} download {percent}% | {filename} ({format_bytes(file_downloaded)}/{format_bytes(file_total)})"
             )
+
+    def _start_save_worker(self) -> None:
+        if self._save_thread is not None and self._save_thread.is_alive():
+            return
+        self._save_thread = threading.Thread(target=self._save_worker_main, name="SubtitleSaveWorker", daemon=True)
+        self._save_thread.start()
+
+    def _enqueue_save(self, task: SaveTask) -> None:
+        self._save_queue.put(task)
+
+    def _wait_for_save_completion(self) -> None:
+        if self._save_thread is None:
+            return
+        self._save_queue.join()
+        self._save_queue.put(None)
+        self._save_queue.join()
+        self._save_thread.join()
+        self._save_thread = None
+
+    def _save_worker_main(self) -> None:
+        while True:
+            task = self._save_queue.get()
+            try:
+                if task is None:
+                    return
+                write_srt_text(task.output_path, task.content)
+                with self._counter_lock:
+                    self._success_count += 1
+                self.item_status_changed.emit(task.source_path, STATUS_DONE, str(task.output_path))
+                self.log_message.emit(f"{task.source_path} | 완료 -> {task.output_path}")
+            except Exception as exc:
+                with self._counter_lock:
+                    self._failure_count += 1
+                message = str(exc) or exc.__class__.__name__
+                self.item_status_changed.emit(task.source_path, STATUS_FAILED, message)
+                self.log_message.emit(f"{task.source_path} | 저장 실패 -> {message}")
+            finally:
+                self._save_queue.task_done()

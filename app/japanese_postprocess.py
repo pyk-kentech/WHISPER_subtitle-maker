@@ -24,6 +24,15 @@ _SPACE_BEFORE_PUNCT = re.compile(rf"\s+([{JP_COMMA}{JP_PERIOD}{JP_EXCL}{JP_QUEST
 _SPACE_AFTER_OPEN = re.compile(r"([\u300c\u300e\uff08])\s+")
 _MULTI_SPACE = re.compile(r"\s+")
 _DUPLICATED_PUNCT = re.compile(rf"([{JP_COMMA}{JP_PERIOD}{JP_EXCL}{JP_QUESTION}])\1+")
+_JP_DOT_BETWEEN = re.compile(rf"(?<=[{_JAPANESE_CHAR}])\.(?=[{_JAPANESE_CHAR}])")
+_JP_DOT_BEFORE_END = re.compile(rf"(?<=[{_JAPANESE_CHAR}])\s*\.\s*(?=$)")
+_JP_DOT_AT_END = re.compile(rf"(?<=[{_JAPANESE_CHAR}])\.$")
+_ASCII_SPACE_BEFORE_JP_PUNCT = re.compile(rf"(?<=[0-9A-Za-z])\s+(?=[{JP_COMMA}{JP_PERIOD}{JP_EXCL}{JP_QUESTION}])")
+_SPACE_AFTER_JP_PUNCT = re.compile(rf"(?<=[{JP_COMMA}{JP_PERIOD}{JP_EXCL}{JP_QUESTION}])\s+")
+_ENDS_WITH_JP_CHAR = re.compile(rf"[{_JAPANESE_CHAR}]$")
+_STARTS_WITH_JP_CHAR = re.compile(rf"^[{_JAPANESE_CHAR}]")
+_NFKC_TRIGGER = re.compile(r"[\uff00-\uffef\u3000]")
+_TOKENIZER_CACHE: dict[str, sudachi_tokenizer.Tokenizer] = {}
 
 _CONTINUATION_ENDINGS = (
     "\u306f",
@@ -106,9 +115,9 @@ def _normalize_punctuation(text: str) -> str:
     normalized = normalized.replace("\uff64", JP_COMMA).replace("\uff61", JP_PERIOD)
     normalized = normalized.replace("\uff0c", JP_COMMA).replace(",", JP_COMMA)
     normalized = normalized.replace("\uff0e", JP_PERIOD)
-    normalized = re.sub(rf"(?<=[{_JAPANESE_CHAR}])\.(?=[{_JAPANESE_CHAR}])", JP_PERIOD, normalized)
-    normalized = re.sub(rf"(?<=[{_JAPANESE_CHAR}])\s*\.\s*(?=$)", JP_PERIOD, normalized)
-    normalized = re.sub(rf"(?<=[{_JAPANESE_CHAR}])\.$", JP_PERIOD, normalized)
+    normalized = _JP_DOT_BETWEEN.sub(JP_PERIOD, normalized)
+    normalized = _JP_DOT_BEFORE_END.sub(JP_PERIOD, normalized)
+    normalized = _JP_DOT_AT_END.sub(JP_PERIOD, normalized)
     normalized = normalized.replace("\uff62", "\u300c").replace("\uff63", "\u300d")
     normalized = normalized.replace("(", "\uff08").replace(")", "\uff09")
     normalized = normalized.replace("\uff08 ", "\uff08").replace(" \uff09", "\uff09")
@@ -134,12 +143,30 @@ def _limit_commas(text: str, max_comma: int) -> str:
     return "".join(output)
 
 
+def _get_tokenizer(split_mode: sudachi_tokenizer.Tokenizer.SplitMode) -> sudachi_tokenizer.Tokenizer:
+    cache_key = str(split_mode)
+    tokenizer_obj = _TOKENIZER_CACHE.get(cache_key)
+    if tokenizer_obj is None:
+        tokenizer_obj = create_dictionary_tokenizer(split_mode)
+        _TOKENIZER_CACHE[cache_key] = tokenizer_obj
+    return tokenizer_obj
+
+
+def _normalize_input_text(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if _NFKC_TRIGGER.search(stripped):
+        return unicodedata.normalize("NFKC", stripped)
+    return stripped
+
+
 def postprocess_japanese_text(text: str, options: PostprocessOptions | None = None) -> str:
     config = options or PostprocessOptions()
     if not config.enabled:
         return text.strip()
 
-    normalized = unicodedata.normalize("NFKC", text).strip()
+    normalized = _normalize_input_text(text)
     if not normalized:
         return ""
 
@@ -147,8 +174,8 @@ def postprocess_japanese_text(text: str, options: PostprocessOptions | None = No
     if config.standard_asia:
         normalized = _normalize_punctuation(normalized)
         normalized = _JP_BOUNDARY.sub("", normalized)
-        normalized = re.sub(rf"(?<=[0-9A-Za-z])\s+(?=[{JP_COMMA}{JP_PERIOD}{JP_EXCL}{JP_QUESTION}])", "", normalized)
-        normalized = re.sub(rf"(?<=[{JP_COMMA}{JP_PERIOD}{JP_EXCL}{JP_QUESTION}])\s+", "", normalized)
+        normalized = _ASCII_SPACE_BEFORE_JP_PUNCT.sub("", normalized)
+        normalized = _SPACE_AFTER_JP_PUNCT.sub("", normalized)
 
     normalized = _limit_commas(normalized, config.max_comma)
     normalized = _MULTI_SPACE.sub(" ", normalized)
@@ -199,7 +226,7 @@ def _should_merge(previous: SubtitleSegment, current: SubtitleSegment, options: 
 
 
 def _build_token_text(text: str, split_mode: sudachi_tokenizer.Tokenizer.SplitMode) -> str:
-    tokenizer_obj = create_dictionary_tokenizer(split_mode)
+    tokenizer_obj = _get_tokenizer(split_mode)
     morphemes = tokenizer_obj.tokenize(text)
     parts: list[str] = []
     for morpheme in morphemes:
@@ -218,7 +245,7 @@ def _build_token_text(text: str, split_mode: sudachi_tokenizer.Tokenizer.SplitMo
         if previous in JP_OPEN_QUOTES:
             parts.append(surface)
             continue
-        if re.search(rf"[{_JAPANESE_CHAR}]$", previous) and re.match(rf"^[{_JAPANESE_CHAR}]", surface):
+        if _ENDS_WITH_JP_CHAR.search(previous) and _STARTS_WITH_JP_CHAR.match(surface):
             parts[-1] = previous.rstrip()
             parts.append(surface)
             continue
@@ -231,7 +258,7 @@ def _is_terminal_with_dictionary(text: str) -> bool:
     if _is_terminal_text(text):
         return True
 
-    tokenizer_obj = create_dictionary_tokenizer(sudachi_tokenizer.Tokenizer.SplitMode.C)
+    tokenizer_obj = _get_tokenizer(sudachi_tokenizer.Tokenizer.SplitMode.C)
     morphemes = tokenizer_obj.tokenize(text)
     if not morphemes:
         return False
@@ -258,7 +285,7 @@ def _should_merge_with_dictionary(
     if gap > options.max_gap:
         return False
 
-    tokenizer_obj = create_dictionary_tokenizer(sudachi_tokenizer.Tokenizer.SplitMode.C)
+    tokenizer_obj = _get_tokenizer(sudachi_tokenizer.Tokenizer.SplitMode.C)
     prev_tokens = tokenizer_obj.tokenize(previous.text)
     curr_tokens = tokenizer_obj.tokenize(current.text)
     if not prev_tokens or not curr_tokens:
@@ -285,6 +312,7 @@ def postprocess_japanese_segments(
     options: PostprocessOptions | None = None,
 ) -> list[SubtitleSegment]:
     config = options or PostprocessOptions()
+    process_text = _enhance_text_with_dictionary if config.enhanced else postprocess_japanese_text
     if not config.enabled:
         return [
             SubtitleSegment(start=segment.start, end=segment.end, text=segment.text.strip())
@@ -294,11 +322,7 @@ def postprocess_japanese_segments(
 
     normalized_segments: list[SubtitleSegment] = []
     for segment in segments:
-        text = (
-            _enhance_text_with_dictionary(segment.text, config)
-            if config.enhanced
-            else postprocess_japanese_text(segment.text, config)
-        )
+        text = process_text(segment.text, config)
         if not text:
             continue
         normalized_segments.append(SubtitleSegment(start=segment.start, end=segment.end, text=text))
@@ -315,21 +339,13 @@ def postprocess_japanese_segments(
             else _should_merge(previous, segment, config)
         )
         if should_merge:
-            previous.text = (
-                _enhance_text_with_dictionary(f"{previous.text}{segment.text}", config)
-                if config.enhanced
-                else postprocess_japanese_text(f"{previous.text}{segment.text}", config)
-            )
+            previous.text = process_text(f"{previous.text}{segment.text}", config)
             previous.end = max(previous.end, segment.end)
             continue
         merged_segments.append(segment)
 
     for segment in merged_segments:
-        segment.text = (
-            _enhance_text_with_dictionary(segment.text, config)
-            if config.enhanced
-            else postprocess_japanese_text(segment.text, config)
-        )
+        segment.text = process_text(segment.text, config)
         if config.sentence:
             if config.enhanced:
                 if _is_terminal_with_dictionary(segment.text) and not _has_terminal_punctuation(segment.text):

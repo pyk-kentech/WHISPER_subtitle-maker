@@ -1,10 +1,13 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
 
 from .config import (
+    API_KEYS_CREDENTIAL_NAME,
+    DEFAULT_OUTPUT_LANGUAGE,
     DEFAULT_TRANSLATION_CHUNK_SIZE,
+    DEFAULT_TRANSLATION_REQUEST_DELAY_SECONDS,
     DEFAULT_TRANSLATION_REASONING_LEVEL,
     DEFAULT_TRANSLATION_SYSTEM_PROMPT,
     DEFAULT_TRANSLATION_TEMPERATURE,
@@ -12,12 +15,15 @@ from .config import (
     get_translator_keys_path,
     get_translator_settings_path,
 )
+from .credential_store import CredentialStoreError, delete_secret, load_secret, save_secret
 
 
 @dataclass(slots=True)
 class TranslatorSettings:
     preferred_model: str = ""
+    target_language: str = DEFAULT_OUTPUT_LANGUAGE
     chunk_size: int = DEFAULT_TRANSLATION_CHUNK_SIZE
+    request_delay_seconds: float = DEFAULT_TRANSLATION_REQUEST_DELAY_SECONDS
     temperature: float = DEFAULT_TRANSLATION_TEMPERATURE
     top_p: float = DEFAULT_TRANSLATION_TOP_P
     reasoning_level: str = DEFAULT_TRANSLATION_REASONING_LEVEL
@@ -36,7 +42,9 @@ def load_translator_settings() -> TranslatorSettings:
 
     return TranslatorSettings(
         preferred_model=str(data.get("preferred_model", "")),
+        target_language=str(data.get("target_language", DEFAULT_OUTPUT_LANGUAGE)),
         chunk_size=int(data.get("chunk_size", DEFAULT_TRANSLATION_CHUNK_SIZE)),
+        request_delay_seconds=float(data.get("request_delay_seconds", DEFAULT_TRANSLATION_REQUEST_DELAY_SECONDS)),
         temperature=float(data.get("temperature", DEFAULT_TRANSLATION_TEMPERATURE)),
         top_p=float(data.get("top_p", DEFAULT_TRANSLATION_TOP_P)),
         reasoning_level=str(data.get("reasoning_level", DEFAULT_TRANSLATION_REASONING_LEVEL)),
@@ -52,14 +60,36 @@ def save_translator_settings(settings: TranslatorSettings) -> None:
 
 
 def load_api_keys() -> list[str]:
+    try:
+        stored = load_secret(API_KEYS_CREDENTIAL_NAME)
+    except CredentialStoreError:
+        stored = ""
+
+    if stored:
+        return [line.strip() for line in stored.splitlines() if line.strip()]
+
     path = get_translator_keys_path()
     if not path.is_file():
         return []
-    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    plaintext = path.read_text(encoding="utf-8")
+    normalized = "\n".join(line.strip() for line in plaintext.splitlines() if line.strip())
+    if normalized:
+        try:
+            save_secret(API_KEYS_CREDENTIAL_NAME, normalized)
+            path.unlink(missing_ok=True)
+        except CredentialStoreError:
+            pass
+    return [line.strip() for line in normalized.splitlines() if line.strip()]
 
 
 def save_api_keys(keys_text: str) -> None:
+    normalized = "\n".join(line.strip() for line in keys_text.splitlines() if line.strip())
     path = get_translator_keys_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    normalized = "\n".join(line.strip() for line in keys_text.splitlines() if line.strip())
-    path.write_text((normalized + "\n") if normalized else "", encoding="utf-8")
+    if normalized:
+        save_secret(API_KEYS_CREDENTIAL_NAME, normalized)
+    else:
+        delete_secret(API_KEYS_CREDENTIAL_NAME)
+    if path.exists():
+        path.unlink(missing_ok=True)

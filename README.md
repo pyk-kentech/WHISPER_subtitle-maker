@@ -1,182 +1,134 @@
 # Dongeum Sub Maker
 
-일본어 음성 파일(`.mp3`, `.mp4`)에서 `.srt` 자막을 생성하는 **Windows 전용 GUI 프로그램**입니다.
+Windows 전용 GUI 프로그램입니다. `.mp3`, `.mp4` 파일에서 자막을 만들고, 필요하면 번역까지 이어서 처리할 수 있습니다.
 
-본 프로그램은 기존 PotPlayer 프로젝트와는 별도로 개발되었으며,
-고정된 설정(`Faster-Whisper medium / Japanese`)으로 동작합니다.
+## 주요 기능
 
----
+- 입력 파일: `.mp3`, `.mp4`
+- 입력 방식: 파일 추가, 폴더 추가, 드래그 앤 드롭
+- 폴더 추가 시 하위 폴더 포함 옵션 지원
+- Whisper 모델 선택 지원
+  - `faster-whisper-XXL-tiny`
+  - `faster-whisper-XXL-base`
+  - `faster-whisper-XXL-small`
+  - `faster-whisper-XXL-medium`
+  - `faster-whisper-XXL-large-v3`
+  - `faster-whisper-XXL-large-v3-turbo`
+- 입력 언어 선택 지원
+  - `auto`, `ja`, `en`, `ko`, `zh`
+- 출력 번역 언어 선택 지원
+  - `ko`, `en`, `ja`
+- 실행 장치 선택
+  - CPU
+  - GPU (CUDA)
+- VAD 세부 설정 지원
+  - 사용 여부
+  - 최소 침묵 시간
+  - speech pad
+- 추론 튜닝 지원
+  - `compute_type`
+  - `CPU threads`
+  - `num_workers`
+  - 작업 완료 후 모델 자동 해제
+- 파일 1개씩 순차 처리
+- 작업 중 파일 추가 가능
+- 기존 `.srt` 존재 시 덮어쓰기 없이 스킵
+- 번역용 Gemini API 키는 Windows Credential Manager에 저장
+- 로그 파일 저장 및 UI 로그 표시 지원
 
-## ✨ 주요 기능
+## 출력 규칙
 
-* 🎧 입력 지원: `.mp3`, `.mp4`
-* 📄 출력 형식: `.srt` (원본 파일과 동일한 폴더)
-* 🏷 파일 이름: `원본파일명.srt`
-* 🌏 언어: 일본어 (`ja`) 고정
-* 🤖 모델: `Systran/faster-whisper-medium` 고정
-* ⚙ 실행 장치 선택:
+- 출력 파일은 원본과 같은 폴더에 저장됩니다.
+- 파일명은 원본 basename 기준 `.srt`입니다.
+- 예:
+  - `D:\media\a.mp4 -> D:\media\a.srt`
+  - `E:\audio\b.mp3 -> E:\audio\b.srt`
+- 기존 `.srt`가 있으면 스킵합니다.
 
-  * CPU
-  * GPU (CUDA)
-* 🔄 처리 방식:
+## SRT 형식
 
-  * 파일 단위 **순차 처리**
-  * 작업 중에도 파일 추가 가능 (큐 자동 이어서 처리)
-* 🚫 기존 자막 파일 존재 시:
+- 인덱스는 1부터 시작
+- 시간 형식은 `HH:MM:SS,mmm`
+- 구분자는 `-->`
+- 블록 사이 빈 줄 1개
+- UTF-8 BOM으로 저장
 
-  * 덮어쓰기 금지
-  * 자동 스킵
-
----
-
-## 📁 프로젝트 구조
-
-```text
-WHISPER_subtitle-maker/
-  app/
-    config.py
-    file_queue.py
-    main.py
-    model_manager.py
-    srt_writer.py
-    transcriber.py
-    ui.py
-    workers.py
-  build.ps1
-  requirements.txt
-  README.md
-```
-
----
-
-## 🧩 요구 사항
-
-* Python 3.11 (권장)
-* PySide6
-* faster-whisper
-* huggingface_hub
-* tqdm
-* PyInstaller
-
----
-
-## 🚀 실행 방법
-
-### 1. 코드 다운로드
-
-```bash
-git clone https://github.com/pyk-kentech/WHISPER_subtitle-maker.git
-cd WHISPER_subtitle-maker
-```
-
-### 2. 가상환경 생성 및 실행
+## 실행 방법
 
 ```powershell
+cd "d:\PotPlayer\Dongeum sub maker"
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 .\.venv\Scripts\python -m app.main
 ```
 
----
+최초 실행 시 선택한 Whisper 모델이 자동 다운로드됩니다.
 
-## 📦 빌드 방법
-
-### 일반 빌드
+## 빌드 방법
 
 ```powershell
+cd "d:\PotPlayer\Dongeum sub maker"
 .\build.ps1
 ```
 
-### 단일 EXE 빌드 (One-file)
+`one-file` 빌드:
 
 ```powershell
+cd "d:\PotPlayer\Dongeum sub maker"
 .\build-onefile.ps1
 ```
 
-빌드할때 WHISPER_subtitle-maker 폴더 안에 .ico 파일을 넣는다면, 자동으로 그 아이콘을 프로그램 아이콘으로 사용합니다.
+## 폴더 구조
 
-
-📌 결과물 위치:
-
+```text
+Dongeum sub maker/
+  app/
+    app_logging.py
+    config.py
+    credential_store.py
+    dictionary_pack.py
+    file_queue.py
+    gemini_translator.py
+    japanese_postprocess.py
+    main.py
+    model_manager.py
+    srt_writer.py
+    subtitle_document.py
+    transcriber.py
+    translator_store.py
+    ui.py
+    workers.py
+  build.ps1
+  build-onefile.ps1
+  requirements.txt
+  LICENSE.md
+  README.md
 ```
-dist\DongeumSubMaker
-```
 
-* `--windowed` 옵션 적용 (콘솔 없이 실행되는 GUI)
+## 캐시 및 저장 위치
 
----
+- 앱 데이터 폴더: `%LOCALAPPDATA%\DongeumSubMaker`
+- Whisper 모델 캐시: `%LOCALAPPDATA%\DongeumSubMaker\models\...`
+- CUDA 런타임 캐시: `%LOCALAPPDATA%\DongeumSubMaker\cuda-runtime`
+- 사전팩 캐시: `%LOCALAPPDATA%\DongeumSubMaker\dictionary-pack`
+- 로그 파일: `%LOCALAPPDATA%\DongeumSubMaker\logs\app.log`
+- 번역 설정: `%LOCALAPPDATA%\DongeumSubMaker\translator-settings.json`
+- Gemini API 키: Windows Credential Manager
 
-## 🤖 모델 다운로드 및 캐싱
+## 로깅
 
-* 모델은 저장소에 포함되지 않음
-* 최초 실행 시 자동 다운로드
-* 캐시 경로:
+- 파일 로그와 UI 로그를 모두 지원합니다.
+- 파일 로그는 `INFO`, `WARNING`, `ERROR`, `DEBUG`를 기록합니다.
+- UI 로그는 중요한 로그 위주로 표시합니다.
+- 로그 로테이션이 적용됩니다.
 
-  ```
-  %LOCALAPPDATA%\DongeumSubMaker\models\faster-whisper-medium
-  ```
+## 번역 처리
 
-### 특징
+- Gemini 요청 간 지연 시간 설정 지원
+- adaptive throttling 적용
+- 429 / quota 발생 시 exponential backoff 적용
+- 여러 API 키를 순환 사용
 
-* 1회 다운로드 후 재사용
-* GUI에서 다운로드 진행률 표시
-* 실패 시 재시도 버튼 제공
+## 라이선스
 
----
-
-## 📝 자막 생성 프로세스
-
-1. 파일 드래그 앤 드롭 또는 선택
-2. 출력 `.srt` 경로 자동 생성
-3. 기존 `.srt` 존재 시 → 스킵
-4. 없는 파일만 순차 처리
-5. Faster-Whisper로 음성 인식 수행
-6. SRT 형식으로 저장
-
----
-
-## 📄 SRT 출력 규칙
-
-* 인덱스: 1부터 시작
-* 시간 형식: `HH:MM:SS,mmm`
-* 구분자: `-->`
-* 블록 간 빈 줄 1개
-* 인코딩: UTF-8 BOM
-
----
-
-## 🧠 내부 구조
-
-| 파일                 | 설명                        |
-| ------------------ | ------------------------- |
-| `file_queue.py`    | 파일 정규화, 중복 제거, 확장자 필터링    |
-| `model_manager.py` | 모델 다운로드 및 캐시 관리           |
-| `transcriber.py`   | Faster-Whisper 로딩 및 음성 인식 |
-| `srt_writer.py`    | SRT 포맷 생성 및 저장            |
-| `ui.py`            | GUI (드래그 앤 드롭, 리스트, 로그 등) |
-| `workers.py`       | 백그라운드 스레드 및 작업 관리         |
-
----
-
-## ⚡ 성능 최적화
-
-* GPU 사용 시:
-
-  * CUDA 가능 여부 확인
-  * `float16` 우선 사용
-* CPU 사용 시:
-
-  * `int8` 우선 사용
-  * CPU 스레드 수를 약간 제한하여 시스템 응답성 유지
-* 처리 방식:
-
-  * 항상 **파일 단위 순차 처리**
-* GUI 표시:
-
-  * 전체 진행 상태
-  * 현재 파일 진행률
-
-
-
-
----
+이 프로젝트의 라이선스는 MIT License입니다. 자세한 내용은 [LICENSE.md](LICENSE.md)를 참고하세요.

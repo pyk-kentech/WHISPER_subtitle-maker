@@ -6,10 +6,36 @@ from pathlib import Path
 
 APP_NAME = "Dongeum Sub Maker"
 APP_AUTHOR = "Codex"
+API_KEYS_CREDENTIAL_NAME = "DongeumSubMaker/GeminiApiKeys"
 
-MODEL_REPO_ID = "Systran/faster-whisper-medium"
-MODEL_LANGUAGE = "ja"
-MODEL_LABEL = "Faster-Whisper-XXL / medium / japanese"
+MODEL_PRESETS = {
+    "tiny": {
+        "label": "faster-whisper-XXL-tiny",
+        "repo_id": "Systran/faster-whisper-tiny",
+    },
+    "base": {
+        "label": "faster-whisper-XXL-base",
+        "repo_id": "Systran/faster-whisper-base",
+    },
+    "small": {
+        "label": "faster-whisper-XXL-small",
+        "repo_id": "Systran/faster-whisper-small",
+    },
+    "medium": {
+        "label": "faster-whisper-XXL-medium",
+        "repo_id": "Systran/faster-whisper-medium",
+    },
+    "large-v3": {
+        "label": "faster-whisper-XXL-large-v3",
+        "repo_id": "Systran/faster-whisper-large-v3",
+    },
+    "large-v3-turbo": {
+        "label": "faster-whisper-XXL-large-v3-turbo",
+        "repo_id": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    },
+}
+DEFAULT_MODEL_KEY = "medium"
+MODEL_LABEL = MODEL_PRESETS[DEFAULT_MODEL_KEY]["label"]
 SUPPORTED_EXTENSIONS = {".mp3", ".mp4"}
 MODEL_REQUIRED_FILES = (
     "config.json",
@@ -17,12 +43,33 @@ MODEL_REQUIRED_FILES = (
     "tokenizer.json",
     "vocabulary.txt",
 )
+INPUT_LANGUAGE_OPTIONS = [
+    ("auto", "Auto Detect"),
+    ("ja", "Japanese"),
+    ("en", "English"),
+    ("ko", "Korean"),
+    ("zh", "Chinese"),
+]
+OUTPUT_LANGUAGE_OPTIONS = [
+    ("ko", "Korean"),
+    ("en", "English"),
+    ("ja", "Japanese"),
+]
+DEFAULT_INPUT_LANGUAGE = "ja"
+DEFAULT_OUTPUT_LANGUAGE = "ko"
+DEFAULT_VAD_ENABLED = True
+DEFAULT_VAD_MIN_SILENCE_MS = 500
+DEFAULT_VAD_SPEECH_PAD_MS = 200
 
 TRANSLATOR_SUPPORTED_EXTENSIONS = {".srt", ".vtt", ".txt"}
 DEFAULT_TRANSLATION_CHUNK_SIZE = 80
 DEFAULT_TRANSLATION_TEMPERATURE = 1.0
 DEFAULT_TRANSLATION_TOP_P = 0.8
 DEFAULT_TRANSLATION_REASONING_LEVEL = "minimal"
+DEFAULT_TRANSLATION_REQUEST_DELAY_SECONDS = 6.0
+DEFAULT_TRANSLATION_REQUEST_DELAY_JITTER_SECONDS = 1.5
+DEFAULT_TRANSLATION_BACKOFF_BASE_SECONDS = 5.0
+DEFAULT_TRANSLATION_BACKOFF_MAX_SECONDS = 20.0
 DEFAULT_TRANSLATION_MODELS = [
     "gemini-3-flash-preview",
     "gemini-2.5-flash-preview-09-2025",
@@ -53,7 +100,12 @@ def get_app_data_dir() -> Path:
 
 
 def get_model_cache_dir() -> Path:
-    return get_app_data_dir() / "models" / "faster-whisper-medium"
+    return get_model_cache_dir_for(DEFAULT_MODEL_KEY)
+
+
+def get_model_cache_dir_for(model_key: str) -> Path:
+    safe_key = model_key.strip().lower()
+    return get_app_data_dir() / "models" / f"faster-whisper-{safe_key}"
 
 
 def get_hf_cache_dir() -> Path:

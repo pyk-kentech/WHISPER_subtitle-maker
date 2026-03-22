@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+import gc
 import os
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -10,10 +13,19 @@ import av
 import ctranslate2
 from faster_whisper import WhisperModel
 
-from .config import MODEL_LANGUAGE
+from .config import DEFAULT_MODEL_KEY
 from .cuda_runtime import add_cuda_runtime_to_path, has_cuda_device, is_cuda_runtime_ready
 from .model_manager import get_model_dir, is_model_ready
 from .srt_writer import SubtitleSegment
+
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None
+
+
+CPU_COMPUTE_TYPE_OPTIONS = ["auto", "int8", "int8_float32", "float32"]
+CUDA_COMPUTE_TYPE_OPTIONS = ["auto", "float16", "int8_float16", "int8_float32", "float32"]
 
 
 @dataclass(slots=True)
@@ -21,16 +33,48 @@ class RuntimeConfig:
     device: str
     compute_type: str
     cpu_threads: int
+    num_workers: int
     label: str
+
+
+@dataclass(slots=True)
+class VADSettings:
+    enabled: bool = True
+    min_silence_duration_ms: int = 500
+    speech_pad_ms: int = 200
+
+
+@dataclass(slots=True)
+class RuntimeTuningOptions:
+    compute_type: str = "auto"
+    cpu_threads: int | None = None
+    num_workers: int = 1
+    auto_unload_after_job: bool = True
+
+
+@dataclass(slots=True)
+class LoadedModelInfo:
+    model_key: str
+    device: str
+    compute_type: str
+    cpu_threads: int
+    num_workers: int
+    loaded_at: float
+    last_used_at: float
+
+
+_MODEL_CACHE_LOCK = threading.Lock()
+_MODEL_CACHE: dict[tuple[str, str, str, int, int], WhisperModel] = {}
+_MODEL_META: dict[tuple[str, str, str, int, int], LoadedModelInfo] = {}
 
 
 def is_cuda_runtime_available() -> tuple[bool, str]:
     if not has_cuda_device():
-        return False, "CUDA GPU를 찾지 못했습니다."
+        return False, "CUDA GPU was not detected."
 
     add_cuda_runtime_to_path()
     if not is_cuda_runtime_ready():
-        return False, "CUDA 런타임 다운로드가 필요합니다."
+        return False, "CUDA runtime is not ready yet."
 
     missing_libraries: list[str] = []
     for library_name in ("cublas64_12.dll",):
@@ -40,7 +84,7 @@ def is_cuda_runtime_available() -> tuple[bool, str]:
             missing_libraries.append(library_name)
 
     if missing_libraries:
-        return False, f"필수 CUDA 라이브러리 없음: {', '.join(missing_libraries)}"
+        return False, f"Required CUDA library is missing: {', '.join(missing_libraries)}"
     return True, ""
 
 
@@ -75,59 +119,152 @@ def get_default_runtime_choice() -> str:
     return "cpu"
 
 
-def build_runtime_config(device: str) -> RuntimeConfig:
+def get_compute_type_choices(device: str) -> list[tuple[str, str]]:
     normalized = device.lower().strip()
+    options = CUDA_COMPUTE_TYPE_OPTIONS if normalized == "cuda" else CPU_COMPUTE_TYPE_OPTIONS
+    return [(item, item) for item in options]
+
+
+def get_default_cpu_threads() -> int:
+    cpu_count = os.cpu_count() or 4
+    return max(1, min(cpu_count - 1, 8))
+
+
+def get_max_worker_count() -> int:
+    return max(1, min(os.cpu_count() or 4, 32))
+
+
+def build_runtime_config(device: str, options: RuntimeTuningOptions | None = None) -> RuntimeConfig:
+    normalized = device.lower().strip()
+    tuning = options or RuntimeTuningOptions()
+    selected_compute_type = tuning.compute_type.strip().lower() or "auto"
+    selected_workers = max(1, int(tuning.num_workers))
+
     if normalized == "cuda":
         available, reason = is_cuda_runtime_available()
         if not available:
-            raise RuntimeError(f"GPU 사용 불가: {reason}")
+            raise RuntimeError(f"GPU is unavailable: {reason}")
 
         supported = ctranslate2.get_supported_compute_types("cuda")
-        for compute_type in ("float16", "int8_float16", "int8_float32", "float32"):
+        preferred_order = ["float16", "int8_float16", "int8_float32", "float32"]
+        if selected_compute_type != "auto":
+            preferred_order = [selected_compute_type]
+
+        for compute_type in preferred_order:
             if compute_type in supported:
                 return RuntimeConfig(
                     device="cuda",
                     compute_type=compute_type,
                     cpu_threads=0,
-                    label=f"GPU (CUDA, {compute_type})",
+                    num_workers=selected_workers,
+                    label=f"GPU (CUDA, {compute_type}, workers={selected_workers})",
                 )
-        raise RuntimeError("GPU에서 사용할 수 있는 compute type을 찾지 못했습니다.")
+        raise RuntimeError("No compatible GPU compute type was found.")
 
     supported = ctranslate2.get_supported_compute_types("cpu")
-    for compute_type in ("int8", "int8_float32", "float32"):
+    preferred_order = ["int8", "int8_float32", "float32"]
+    if selected_compute_type != "auto":
+        preferred_order = [selected_compute_type]
+
+    cpu_threads = tuning.cpu_threads if tuning.cpu_threads is not None else get_default_cpu_threads()
+    cpu_threads = max(1, int(cpu_threads))
+    for compute_type in preferred_order:
         if compute_type in supported:
-            cpu_count = os.cpu_count() or 4
-            cpu_threads = max(1, min(cpu_count - 1, 8))
             return RuntimeConfig(
                 device="cpu",
                 compute_type=compute_type,
                 cpu_threads=cpu_threads,
-                label=f"CPU ({compute_type}, {cpu_threads} threads)",
+                num_workers=selected_workers,
+                label=f"CPU ({compute_type}, threads={cpu_threads}, workers={selected_workers})",
             )
-    raise RuntimeError("CPU에서 사용할 수 있는 compute type을 찾지 못했습니다.")
+    raise RuntimeError("No compatible CPU compute type was found.")
+
+
+def unload_loaded_models(model_key: str | None = None) -> int:
+    with _MODEL_CACHE_LOCK:
+        keys = [key for key in _MODEL_CACHE if model_key is None or key[0] == model_key]
+        for key in keys:
+            del _MODEL_CACHE[key]
+            _MODEL_META.pop(key, None)
+    gc.collect()
+    if torch is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    return len(keys)
+
+
+def get_loaded_model_info(model_key: str | None = None) -> list[LoadedModelInfo]:
+    with _MODEL_CACHE_LOCK:
+        items = list(_MODEL_META.items())
+    result: list[LoadedModelInfo] = []
+    for cache_key, info in items:
+        if model_key is None or cache_key[0] == model_key:
+            result.append(info)
+    return sorted(result, key=lambda item: item.loaded_at, reverse=True)
+
+
+def describe_loaded_model_state(model_key: str, device: str) -> str:
+    infos = get_loaded_model_info(model_key)
+    if not infos:
+        return "모델 없음"
+    for info in infos:
+        if info.device == device:
+            scope = "GPU 사용 중" if info.device == "cuda" else "CPU 사용 중"
+            return f"모델 로딩됨 | {scope} | {info.compute_type}"
+    return "모델 로딩됨"
 
 
 class TranscriptionEngine:
-    def __init__(self, runtime_config: RuntimeConfig) -> None:
+    def __init__(self, runtime_config: RuntimeConfig, model_key: str = DEFAULT_MODEL_KEY) -> None:
         self.runtime_config = runtime_config
-        self._model: WhisperModel | None = None
+        self.model_key = model_key
+
+    def _cache_key(self) -> tuple[str, str, str, int, int]:
+        return (
+            self.model_key,
+            self.runtime_config.device,
+            self.runtime_config.compute_type,
+            self.runtime_config.cpu_threads,
+            self.runtime_config.num_workers,
+        )
 
     def _load_model(self) -> WhisperModel:
-        if self._model is not None:
-            return self._model
+        cache_key = self._cache_key()
+        with _MODEL_CACHE_LOCK:
+            cached = _MODEL_CACHE.get(cache_key)
+            if cached is not None:
+                meta = _MODEL_META.get(cache_key)
+                if meta is not None:
+                    meta.last_used_at = time.time()
+                return cached
 
-        model_dir = get_model_dir()
-        if not is_model_ready(model_dir):
-            raise RuntimeError("모델이 준비되지 않았습니다. 먼저 다운로드를 완료하세요.")
+        model_dir = get_model_dir(self.model_key)
+        if not is_model_ready(model_dir, self.model_key):
+            raise RuntimeError("The selected model is not ready yet. Download it first.")
 
-        self._model = WhisperModel(
+        model = WhisperModel(
             str(model_dir),
             device=self.runtime_config.device,
             compute_type=self.runtime_config.compute_type,
             cpu_threads=self.runtime_config.cpu_threads,
-            num_workers=1,
+            num_workers=self.runtime_config.num_workers,
         )
-        return self._model
+
+        now = time.time()
+        with _MODEL_CACHE_LOCK:
+            _MODEL_CACHE[cache_key] = model
+            _MODEL_META[cache_key] = LoadedModelInfo(
+                model_key=self.model_key,
+                device=self.runtime_config.device,
+                compute_type=self.runtime_config.compute_type,
+                cpu_threads=self.runtime_config.cpu_threads,
+                num_workers=self.runtime_config.num_workers,
+                loaded_at=now,
+                last_used_at=now,
+            )
+        return model
 
     def get_media_duration(self, source_path: Path) -> float:
         try:
@@ -145,15 +282,24 @@ class TranscriptionEngine:
         self,
         source_path: Path,
         progress_callback: Callable[[int, float, float], None] | None = None,
+        language_code: str | None = None,
+        vad_settings: VADSettings | None = None,
     ) -> list[SubtitleSegment]:
         model = self._load_model()
         media_duration = self.get_media_duration(source_path)
+        vad = vad_settings or VADSettings()
+        vad_parameters = {
+            "min_silence_duration_ms": max(0, int(vad.min_silence_duration_ms)),
+            "speech_pad_ms": max(0, int(vad.speech_pad_ms)),
+        }
+
         segments, _ = model.transcribe(
             str(source_path),
-            language=MODEL_LANGUAGE,
+            language=language_code,
             task="transcribe",
             beam_size=5 if self.runtime_config.device == "cuda" else 3,
-            vad_filter=True,
+            vad_filter=bool(vad.enabled),
+            vad_parameters=vad_parameters,
             condition_on_previous_text=True,
             chunk_length=30,
         )
@@ -176,6 +322,11 @@ class TranscriptionEngine:
                 if percent != last_percent:
                     last_percent = percent
                     progress_callback(percent, float(segment.end), media_duration)
+
+        with _MODEL_CACHE_LOCK:
+            meta = _MODEL_META.get(self._cache_key())
+            if meta is not None:
+                meta.last_used_at = time.time()
 
         if progress_callback is not None:
             progress_callback(100, media_duration, media_duration)

@@ -1,7 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 from typing import Iterable
 
 
@@ -42,5 +43,21 @@ def build_srt_text(segments: Iterable[SubtitleSegment]) -> str:
 def write_srt(path: Path, segments: Iterable[SubtitleSegment]) -> None:
     srt_text = build_srt_text(segments)
     if not srt_text:
-        raise ValueError("인식 결과가 비어 있어 SRT를 생성할 수 없습니다.")
-    path.write_text(srt_text, encoding="utf-8-sig")
+        raise ValueError("SRT text is empty.")
+    write_srt_text(path, srt_text)
+
+
+def write_srt_text(path: Path, srt_text: str) -> None:
+    if not srt_text.strip():
+        raise ValueError("SRT text is empty.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8-sig",
+        delete=False,
+        dir=str(path.parent),
+        suffix=".tmp",
+    ) as handle:
+        handle.write(srt_text)
+        temp_path = Path(handle.name)
+    temp_path.replace(path)

@@ -1,11 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from dataclasses import dataclass
 import html
+import random
 import re
 import time
-from typing import Callable
 import warnings
+from dataclasses import dataclass
+from typing import Callable
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore", FutureWarning)
@@ -13,15 +14,26 @@ with warnings.catch_warnings():
 
 from google.generativeai.types import HarmBlockThreshold, HarmCategory
 
-from .config import DEFAULT_TRANSLATION_MODELS
+from .config import (
+    DEFAULT_TRANSLATION_BACKOFF_BASE_SECONDS,
+    DEFAULT_TRANSLATION_BACKOFF_MAX_SECONDS,
+    DEFAULT_TRANSLATION_MODELS,
+    DEFAULT_TRANSLATION_REQUEST_DELAY_JITTER_SECONDS,
+)
 
 
 LogCallback = Callable[[str], None]
 
-USER_CONTENT_TEMPLATE = """<main id="원문">
+USER_CONTENT_TEMPLATE = """<main id=\"source\">
 {{slot}}
 </main>
-<main id="번역">"""
+<main id=\"translation\">"""
+
+TARGET_LANGUAGE_LABELS = {
+    "ko": "한국어",
+    "en": "English",
+    "ja": "日本語",
+}
 
 
 class TranslationError(RuntimeError):
@@ -40,13 +52,18 @@ class SafetyBlockedError(TranslationError):
 class TranslationConfig:
     keys: list[str]
     preferred_model: str
+    target_language: str
     system_prompt: str
     translation_note: str
     temperature: float
     top_p: float
     reasoning_level: str
     chunk_size: int
+    request_delay_seconds: float
     wait_seconds_when_exhausted: int = 60
+    min_adaptive_delay_seconds: float = 1.0
+    max_adaptive_delay_seconds: float = 12.0
+    max_retry_per_chunk: int = 8
 
 
 class GeminiTranslator:
@@ -55,6 +72,11 @@ class GeminiTranslator:
         self.log_callback = log_callback
         self.error_count = 0
         self._key_index = 0
+        self._last_request_monotonic = 0.0
+        self._adaptive_delay_seconds = max(
+            self.config.min_adaptive_delay_seconds,
+            float(self.config.request_delay_seconds),
+        )
 
     @property
     def current_key_display(self) -> str:
@@ -87,45 +109,59 @@ class GeminiTranslator:
         payload = "\n".join(f'<p id="{record.line_id}">{record.text}</p>' for record in chunk)
         user_prompt = USER_CONTENT_TEMPLATE.replace("{{slot}}", payload)
         note = self.config.translation_note.strip()
+        language_note = _build_target_language_note(self.config.target_language)
         reasoning_note = _build_reasoning_note(self.config.reasoning_level)
-        if reasoning_note:
-            note = f"{note}\n{reasoning_note}".strip()
-        system_prompt = self.config.system_prompt.replace("{{note}}", note)
+        extra_notes = "\n".join(part for part in (language_note, note, reasoning_note) if part).strip()
+        system_prompt = self.config.system_prompt.replace("{{note}}", extra_notes)
 
         while True:
             any_quota_error = False
+            quota_error_count = 0
+            retry_count = 0
             for model_name in self._resolve_model_candidates():
                 for offset in range(len(self.config.keys)):
+                    if retry_count >= self.config.max_retry_per_chunk:
+                        raise TranslationError("Retry limit reached for this translation chunk.")
                     key_index = (self._key_index + offset) % len(self.config.keys)
                     api_key = self.config.keys[key_index]
                     self._key_index = key_index
                     self.log_callback(
-                        f"[{file_name}] 번역 청크 {chunk_index}/{chunk_total} | 모델={model_name} | 키={key_index + 1}/{len(self.config.keys)}"
+                        f"[{file_name}] chunk {chunk_index}/{chunk_total} | model={model_name} | key {key_index + 1}/{len(self.config.keys)}"
                     )
                     try:
+                        self._sleep_for_request_spacing()
                         response_text = self._request_translation(api_key, model_name, system_prompt, user_prompt)
+                        self._last_request_monotonic = time.monotonic()
+                        self._on_request_success()
                         return self._parse_response(response_text, [record.line_id for record in chunk])
                     except SafetyBlockedError as exc:
                         self.error_count += 1
-                        self.log_callback(f"검열 감지, 다음 키로 전환: {exc}")
+                        retry_count += 1
+                        self.log_callback(f"Safety blocked, switching key: {exc}")
                         continue
                     except QuotaExceededError as exc:
                         self.error_count += 1
                         any_quota_error = True
-                        self.log_callback(f"할당량 초과, 다음 키로 전환: {exc}")
+                        quota_error_count += 1
+                        retry_count += 1
+                        self._on_quota_error()
+                        backoff_seconds = self._compute_backoff_seconds(quota_error_count)
+                        self.log_callback(f"Quota exceeded, backing off for {backoff_seconds:.1f}s before switching key: {exc}")
+                        time.sleep(backoff_seconds)
                         continue
                     except TranslationError as exc:
                         self.error_count += 1
-                        self.log_callback(f"모델/키 조합 실패, 다음 후보 시도: {exc}")
+                        retry_count += 1
+                        self.log_callback(f"Model/key combination failed, trying next candidate: {exc}")
                         break
 
             if any_quota_error:
                 self.log_callback(
-                    f"모든 키가 할당량 초과 상태입니다. {self.config.wait_seconds_when_exhausted}초 대기 후 재시도합니다."
+                    f"All current keys are rate-limited. Waiting {self.config.wait_seconds_when_exhausted} seconds before retry."
                 )
                 time.sleep(self.config.wait_seconds_when_exhausted)
                 continue
-            raise TranslationError("사용 가능한 Gemini 키/모델 조합으로 번역하지 못했습니다.")
+            raise TranslationError("No available Gemini key/model combination could complete the translation.")
 
     def _request_translation(self, api_key: str, model_name: str, system_prompt: str, user_prompt: str) -> str:
         genai.configure(api_key=api_key)
@@ -168,16 +204,16 @@ class GeminiTranslator:
             message = str(exc)
             if _is_safety_error(message) or "SAFETY" in finish_reason.upper():
                 raise SafetyBlockedError(message or finish_reason) from exc
-            raise TranslationError(message or "응답 텍스트를 읽지 못했습니다.") from exc
+            raise TranslationError(message or "Failed to read response text.") from exc
 
         if not text.strip():
-            raise TranslationError("빈 응답을 받았습니다.")
+            raise TranslationError("Received an empty response.")
         return text
 
     def _parse_response(self, response_text: str, expected_ids: list[str]) -> dict[str, str]:
         pairs = dict(re.findall(r'<p id="([^"]+)">(.*?)</p>', response_text, flags=re.DOTALL))
         if not pairs:
-            raise TranslationError("응답에서 <p id> 구조를 찾지 못했습니다.")
+            raise TranslationError("The response does not contain any <p id=\"...\"> pairs.")
 
         translated: dict[str, str] = {}
         missing: list[str] = []
@@ -188,7 +224,7 @@ class GeminiTranslator:
             translated[line_id] = html.unescape(pairs[line_id].strip())
 
         if missing:
-            raise TranslationError(f"응답에서 누락된 줄 ID가 있습니다: {', '.join(missing[:5])}")
+            raise TranslationError(f"Some expected ids are missing from the response: {', '.join(missing[:5])}")
         return translated
 
     def _resolve_model_candidates(self) -> list[str]:
@@ -196,6 +232,43 @@ class GeminiTranslator:
         if preferred:
             return [preferred, *[item for item in DEFAULT_TRANSLATION_MODELS if item != preferred]]
         return list(DEFAULT_TRANSLATION_MODELS)
+
+    def _sleep_for_request_spacing(self) -> None:
+        base_delay = max(self.config.min_adaptive_delay_seconds, self._adaptive_delay_seconds)
+        if base_delay <= 0:
+            return
+        jitter = random.uniform(0.0, DEFAULT_TRANSLATION_REQUEST_DELAY_JITTER_SECONDS)
+        target_delay = base_delay + jitter
+        if self._last_request_monotonic <= 0:
+            if target_delay > 0:
+                self.log_callback(f"Request delay {target_delay:.1f}s before Gemini call")
+                time.sleep(target_delay)
+            return
+
+        elapsed = time.monotonic() - self._last_request_monotonic
+        remaining = target_delay - elapsed
+        if remaining > 0:
+            self.log_callback(f"Request delay {remaining:.1f}s before Gemini call")
+            time.sleep(remaining)
+
+    def _on_request_success(self) -> None:
+        self._adaptive_delay_seconds = max(
+            self.config.min_adaptive_delay_seconds,
+            self._adaptive_delay_seconds - 0.2,
+        )
+
+    def _on_quota_error(self) -> None:
+        self._adaptive_delay_seconds = min(
+            self.config.max_adaptive_delay_seconds,
+            self._adaptive_delay_seconds + 2.0,
+        )
+
+    def _compute_backoff_seconds(self, quota_error_count: int) -> float:
+        exponent = max(0, quota_error_count - 1)
+        return min(
+            DEFAULT_TRANSLATION_BACKOFF_MAX_SECONDS,
+            DEFAULT_TRANSLATION_BACKOFF_BASE_SECONDS * (2 ** exponent),
+        )
 
 
 def _is_quota_error(message: str) -> bool:
@@ -208,14 +281,22 @@ def _is_safety_error(message: str) -> bool:
     return any(token in lowered for token in ("safety", "blocked", "block_reason", "prohibited", "recitation"))
 
 
+def _build_target_language_note(target_language: str) -> str:
+    label = TARGET_LANGUAGE_LABELS.get(target_language, target_language)
+    return (
+        f"Translate all text content into {label}. Keep every HTML tag, line id, ordering, and subtitle structure unchanged. "
+        "Do not alter timestamps or merge/split lines."
+    )
+
+
 def _build_reasoning_note(reasoning_level: str) -> str:
     normalized = reasoning_level.strip().lower()
     if normalized == "minimal":
-        return "추론 레벨: minimal. 검열 회피 성향을 유지하고 불필요한 자기검열 없이 번역할 것."
+        return "Reasoning level: minimal. Prioritize structure preservation and direct output."
     if normalized == "low":
-        return "추론 레벨: low. 구조 보존을 우선하고 불필요한 설명 없이 번역만 출력할 것."
+        return "Reasoning level: low. Preserve structure and output only the translation result."
     if normalized == "medium":
-        return "추론 레벨: medium. 정확성을 높이되 구조와 줄 대응을 절대로 깨지 말 것."
+        return "Reasoning level: medium. Improve translation quality while keeping structure exact."
     if normalized == "high":
-        return "추론 레벨: high. 정밀하게 번역하되 출력은 번역 결과만 제공하고 구조를 지킬 것."
+        return "Reasoning level: high. Maximize translation quality but preserve structure exactly."
     return ""
