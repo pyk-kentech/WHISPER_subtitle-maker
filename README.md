@@ -56,7 +56,6 @@ Windows 전용 GUI 프로그램입니다. `.mp3`, `.mp4` 파일에서 자막을 
 ## 실행 방법
 
 ```powershell
-cd "d:\PotPlayer\Dongeum sub maker"
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 .\.venv\Scripts\python -m app.main
@@ -67,14 +66,12 @@ python -m venv .venv
 ## 빌드 방법
 
 ```powershell
-cd "d:\PotPlayer\Dongeum sub maker"
 .\build.ps1
 ```
 
 `one-file` 빌드:
 
 ```powershell
-cd "d:\PotPlayer\Dongeum sub maker"
 .\build-onefile.ps1
 ```
 
