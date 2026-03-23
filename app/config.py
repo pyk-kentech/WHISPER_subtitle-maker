@@ -138,3 +138,14 @@ def get_translator_settings_path() -> Path:
 
 def get_log_dir() -> Path:
     return get_app_data_dir() / "logs"
+
+
+def get_project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def get_preferred_icon_path() -> Path | None:
+    icon_files = sorted(get_project_root().glob("*.ico"))
+    if not icon_files:
+        return None
+    return icon_files[0]

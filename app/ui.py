@@ -4,7 +4,7 @@ from datetime import datetime
 import logging
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -50,6 +50,7 @@ from .config import (
     INPUT_LANGUAGE_OPTIONS,
     MODEL_PRESETS,
     OUTPUT_LANGUAGE_OPTIONS,
+    get_preferred_icon_path,
 )
 from .app_logging import get_logger, set_ui_log_callback
 from .file_queue import (
@@ -147,7 +148,7 @@ class DropArea(QFrame):
         )
 
         layout = QVBoxLayout(self)
-        label = QLabel("?ш린??.mp3 / .mp4 ?뚯씪???쒕옒洹????쒕∼")
+        label = QLabel("여기에 .mp3 / .mp4 파일을 드래그 앤 드롭")
         label.setAlignment(Qt.AlignCenter)
         label.setMinimumHeight(220)
         label.setWordWrap(True)
@@ -247,6 +248,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1200, 860)
         self.setMinimumSize(780, 560)
+        self._app_icon = self._load_app_icon()
+        if self._app_icon is not None:
+            self.setWindowIcon(self._app_icon)
 
         self._auto_download_on_startup = auto_download_on_startup
         self._items: dict[str, QueueItem] = {}
@@ -263,8 +267,8 @@ class MainWindow(QMainWindow):
         self.tray_icon: QSystemTrayIcon | None = None
         self._queue_total = 0
         self._queue_processed = 0
-        self._current_file_prefix = "?? ??: ?? ?"
-        self._stage_title = "?? ?"
+        self._current_file_prefix = "현재 파일: 없음"
+        self._stage_title = "대기 중"
         self._stage_detail = ""
 
         self._translator_settings = load_translator_settings()
@@ -279,7 +283,7 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(14, 14, 14, 14)
         root_layout.setSpacing(10)
 
-        title_label = QLabel("??? ?? -> ??? ?? ???")
+        title_label = QLabel("일본어 음성 -> 한국어 자막 생성기")
         title_label.setStyleSheet("font-size: 20px; font-weight: 700;")
         root_layout.addWidget(title_label)
 
@@ -288,14 +292,23 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.subtitle_label)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_main_tab(), "?묒뾽")
-        self.tabs.addTab(self._build_translation_tab(), "踰덉뿭 ?ㅼ젙")
+        self.tabs.addTab(self._build_main_tab(), "작업")
+        self.tabs.addTab(self._build_translation_tab(), "번역 설정")
         root_layout.addWidget(self.tabs, 1)
 
         self.setCentralWidget(central)
         self._create_tray_icon()
         self.log("Program started")
         self.refresh_model_status()
+
+    def _load_app_icon(self) -> QIcon | None:
+        icon_path = get_preferred_icon_path()
+        if icon_path is None:
+            return None
+        icon = QIcon(str(icon_path))
+        if icon.isNull():
+            return None
+        return icon
 
     def _build_main_tab(self) -> QWidget:
         content = QWidget()
@@ -369,7 +382,7 @@ class MainWindow(QMainWindow):
         performance_row.addStretch(1)
         root_layout.addLayout(performance_row)
 
-        self.model_status_label = QLabel("紐⑤뜽 ?곹깭 ?뺤씤 以?..")
+        self.model_status_label = QLabel("모델 상태 확인 중...")
         root_layout.addWidget(self.model_status_label)
 
         self.model_runtime_state_label = QLabel("모델 없음")
@@ -476,7 +489,7 @@ class MainWindow(QMainWindow):
         self.current_file_label = QLabel(self._current_file_prefix)
         root_layout.addWidget(self.current_file_label)
 
-        self.current_stage_label = QLabel("?? ??: ?? ?")
+        self.current_stage_label = QLabel("현재 단계: 대기 중")
         root_layout.addWidget(self.current_stage_label)
 
         self.stage_progress = QProgressBar()
@@ -485,7 +498,7 @@ class MainWindow(QMainWindow):
         self.stage_progress.setStyleSheet(GREEN_BAR_STYLE)
         root_layout.addWidget(self.stage_progress)
 
-        self.translation_progress_label = QLabel("?? ??: ?? ?")
+        self.translation_progress_label = QLabel("번역 진행: 대기 중")
         root_layout.addWidget(self.translation_progress_label)
 
         self.translation_progress = QProgressBar()
@@ -494,7 +507,7 @@ class MainWindow(QMainWindow):
         self.translation_progress.setStyleSheet(GREEN_BAR_STYLE)
         root_layout.addWidget(self.translation_progress)
 
-        self.queue_progress_label = QLabel("?꾩껜 ?湲곗뿴 吏꾪뻾瑜?0 / 0")
+        self.queue_progress_label = QLabel("전체 대기열 진행률 0 / 0")
         root_layout.addWidget(self.queue_progress_label)
 
         self.queue_progress = QProgressBar()
@@ -535,7 +548,7 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.quit_from_tray)
         tray_menu.addAction(quit_action)
 
-        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        icon = self._app_icon or self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
         self.tray_icon = QSystemTrayIcon(icon, self)
         self.tray_icon.setToolTip(APP_NAME)
         self.tray_icon.setContextMenu(tray_menu)
@@ -588,15 +601,15 @@ class MainWindow(QMainWindow):
         self.translation_settings_status.setStyleSheet("color: #2f6f3e;")
         save_row.addWidget(self.translation_settings_status)
         save_row.addStretch(1)
-        self.save_translation_button = QPushButton("??")
+        self.save_translation_button = QPushButton("저장")
         self.save_translation_button.setEnabled(False)
         self.save_translation_button.clicked.connect(self.save_translation_inputs)
         save_row.addWidget(self.save_translation_button)
         layout.addLayout(save_row)
 
-        api_box = QGroupBox("API ?")
+        api_box = QGroupBox("API 키")
         api_layout = QVBoxLayout(api_box)
-        api_layout.addWidget(QLabel("?щ윭 ?ㅻ? ??以꾩뿉 ?섎굹???낅젰?섎㈃ ?먮룞 ??λ맗?덈떎."))
+        api_layout.addWidget(QLabel("여러 키를 한 줄에 하나씩 입력하면 자동으로 순환 사용합니다."))
         self.keys_edit = QPlainTextEdit(self._saved_api_keys_text)
         self.keys_edit.setPlaceholderText("AIza...")
         self.keys_edit.setMinimumHeight(140)
@@ -604,19 +617,19 @@ class MainWindow(QMainWindow):
         api_layout.addWidget(self.keys_edit)
         layout.addWidget(CollapsibleSection("API Keys", api_box, expanded=True))
 
-        option_box = QGroupBox("Gemini 踰덉뿭 ?듭뀡")
+        option_box = QGroupBox("Gemini 번역 옵션")
         form = QFormLayout(option_box)
 
         self.model_edit = QLineEdit(self._translator_settings.preferred_model)
-        self.model_edit.setPlaceholderText("鍮꾩슦硫??먮룞 紐⑤뜽 ?쒖꽌 ?ъ슜")
+        self.model_edit.setPlaceholderText("비우면 자동 모델 순서 사용")
         self.model_edit.textChanged.connect(self.mark_translation_inputs_dirty)
-        form.addRow("?? ??", self.model_edit)
+        form.addRow("선호 모델", self.model_edit)
 
         self.chunk_size_spin = QSpinBox()
         self.chunk_size_spin.setRange(10, 200)
         self.chunk_size_spin.setValue(self._translator_settings.chunk_size)
         self.chunk_size_spin.valueChanged.connect(self.mark_translation_inputs_dirty)
-        form.addRow("泥?겕 ?ш린", self.chunk_size_spin)
+        form.addRow("청크 크기", self.chunk_size_spin)
 
         self.request_delay_spin = QDoubleSpinBox()
         self.request_delay_spin.setRange(0.0, 30.0)
@@ -629,14 +642,14 @@ class MainWindow(QMainWindow):
         self.reasoning_combo.addItems(["minimal", "low", "medium", "high"])
         self.reasoning_combo.setCurrentText(self._translator_settings.reasoning_level)
         self.reasoning_combo.currentTextChanged.connect(self.mark_translation_inputs_dirty)
-        form.addRow("異붾줎 ?덈꺼", self.reasoning_combo)
+        form.addRow("추론 레벨", self.reasoning_combo)
 
         self.temperature_spin = QDoubleSpinBox()
         self.temperature_spin.setRange(0.0, 2.0)
         self.temperature_spin.setSingleStep(0.1)
         self.temperature_spin.setValue(self._translator_settings.temperature)
         self.temperature_spin.valueChanged.connect(self.mark_translation_inputs_dirty)
-        form.addRow("?⑤룄", self.temperature_spin)
+        form.addRow("온도", self.temperature_spin)
 
         self.top_p_spin = QDoubleSpinBox()
         self.top_p_spin.setRange(0.0, 1.0)
@@ -646,15 +659,15 @@ class MainWindow(QMainWindow):
         form.addRow("Top-P", self.top_p_spin)
         layout.addWidget(CollapsibleSection("Gemini Translation Options", option_box, expanded=True))
 
-        prompt_box = QGroupBox("?꾨＼?꾪듃")
+        prompt_box = QGroupBox("프롬프트")
         prompt_layout = QVBoxLayout(prompt_box)
-        prompt_layout.addWidget(QLabel("?쒖뒪???꾨＼?꾪듃"))
+        prompt_layout.addWidget(QLabel("시스템 프롬프트"))
         self.system_prompt_edit = QPlainTextEdit(self._translator_settings.system_prompt)
         self.system_prompt_edit.setMinimumHeight(240)
         self.system_prompt_edit.textChanged.connect(self.mark_translation_inputs_dirty)
         prompt_layout.addWidget(self.system_prompt_edit)
 
-        prompt_layout.addWidget(QLabel("踰덉뿭 ?명듃"))
+        prompt_layout.addWidget(QLabel("번역 노트"))
         self.note_edit = QPlainTextEdit(self._translator_settings.translation_note)
         self.note_edit.setMinimumHeight(140)
         self.note_edit.textChanged.connect(self.mark_translation_inputs_dirty)
@@ -684,7 +697,7 @@ class MainWindow(QMainWindow):
             return
 
         if self.is_busy():
-            QMessageBox.warning(self, APP_NAME, "?ㅼ슫濡쒕뱶 ?먮뒗 ?묒뾽??吏꾪뻾 以묒엯?덈떎.")
+            QMessageBox.warning(self, APP_NAME, "다운로드 또는 작업이 진행 중입니다.")
             event.ignore()
             return
         super().closeEvent(event)
@@ -782,7 +795,7 @@ class MainWindow(QMainWindow):
     def mark_translation_inputs_dirty(self) -> None:
         self._settings_dirty = True
         self.sync_translation_save_state()
-        self.translation_settings_status.setText("???? ?? ????")
+        self.translation_settings_status.setText("저장되지 않은 변경사항")
 
     def save_translation_inputs(self) -> None:
         self._saved_api_keys_text = self.keys_edit.toPlainText()
@@ -796,7 +809,7 @@ class MainWindow(QMainWindow):
             return
         self._settings_dirty = False
         self.sync_translation_save_state()
-        self.translation_settings_status.setText("?ㅼ젙????λ릺?덉뒿?덈떎")
+        self.translation_settings_status.setText("설정이 저장되었습니다")
         self.log("번역 설정이 저장되었습니다.")
 
     def update_file_area_mode(self) -> None:
@@ -911,7 +924,7 @@ class MainWindow(QMainWindow):
         for item in items:
             key = str(item.source_path)
             if key in self._items:
-                self.log(f"?대? 紐⑸줉??議댁옱?? {item.source_path}")
+                self.log(f"이미 목록에 존재함: {item.source_path}")
                 continue
 
             row = self.table.rowCount()
@@ -976,7 +989,7 @@ class MainWindow(QMainWindow):
             return
         selected_rows = selection_model.selectedRows()
         if not selected_rows:
-            self.log("?쒓굅???뚯씪???좏깮?섏? ?딆븯?듬땲??")
+            self.log("제거할 파일을 선택하지 않았습니다.")
             return
 
         removable_paths: list[str] = []
@@ -993,7 +1006,7 @@ class MainWindow(QMainWindow):
         else:
             removed_count = self._remove_paths(removable_paths)
         if removed_count:
-            self.log(f"?좏깮???뚯씪 {removed_count}媛쒕? 紐⑸줉?먯꽌 ?쒓굅?덉뒿?덈떎.")
+            self.log(f"선택한 파일 {removed_count}개를 목록에서 제거했습니다.")
         if blocked_count:
             self.log("현재 처리중인 파일은 즉시 제거할 수 없습니다.")
 
@@ -1017,7 +1030,7 @@ class MainWindow(QMainWindow):
         if status == STATUS_DONE:
             removed_count = self._remove_paths([source_path])
             if removed_count:
-                self.log(f"?꾨즺 ?뚯씪 ?먮룞 ?쒓굅: {source_path}")
+                self.log(f"완료 파일 자동 제거: {source_path}")
         elif status == STATUS_REMOVED:
             self._remove_paths([source_path])
 
@@ -1075,15 +1088,15 @@ class MainWindow(QMainWindow):
         api_keys = load_api_keys()
         if not api_keys:
             self.tabs.setCurrentIndex(1)
-            QMessageBox.warning(self, APP_NAME, "踰덉뿭 ?ㅼ젙 ??뿉 Gemini API ?ㅻ? ?낅젰?섏꽭??")
+            QMessageBox.warning(self, APP_NAME, "번역 설정 탭에 Gemini API 키를 입력해 주세요.")
             return
         if not self._model_ready:
-            self.log("紐⑤뜽 以鍮??꾩뿉???묒뾽???쒖옉?????놁뒿?덈떎.")
+            self.log("모델 준비 전에는 작업을 시작할 수 없습니다.")
             return
 
         source_paths = [path for path, item in self._items.items() if item.status in {STATUS_PENDING, STATUS_FAILED}]
         if not source_paths:
-            self.log("泥섎━???뚯씪???놁뒿?덈떎.")
+            self.log("처리할 파일이 없습니다.")
             return
 
         for source_path in source_paths:
@@ -1095,13 +1108,13 @@ class MainWindow(QMainWindow):
         self._session_skipped_count = 0
         self._queue_total = len(source_paths)
         self._queue_processed = 0
-        self.current_file_label.setText("?? ??: ?? ?")
-        self._stage_title = "?? ??"
+        self.current_file_label.setText("현재 파일: 없음")
+        self._stage_title = "작업 준비"
         self._stage_detail = ""
-        self.current_stage_label.setText("?? ??: ?? ??")
+        self.current_stage_label.setText("현재 단계: 작업 준비")
         self.stage_progress.setValue(0)
         self.translation_progress.setValue(0)
-        self.translation_progress_label.setText("?? ??: ?? ?")
+        self.translation_progress_label.setText("번역 진행: 대기 중")
 
         job = PipelineJob(
             source_paths=source_paths,
@@ -1143,7 +1156,7 @@ class MainWindow(QMainWindow):
             finished = sum(1 for item in self._items.values() if item.status in {STATUS_DONE, STATUS_FAILED, STATUS_SKIPPED})
         percent = 100 if total == 0 else int(finished * 100 / total)
         self.queue_progress.setValue(percent)
-        self.queue_progress_label.setText(f"?꾩껜 ?湲곗뿴 吏꾪뻾瑜?{finished} / {total}")
+        self.queue_progress_label.setText(f"전체 대기열 진행률 {finished} / {total}")
 
     def on_queue_progress_changed(self, processed: int, total: int) -> None:
         self._queue_processed = processed
@@ -1151,12 +1164,12 @@ class MainWindow(QMainWindow):
         self.refresh_queue_progress()
 
     def on_file_started(self, index: int, total: int, source_path: str) -> None:
-        self.current_file_label.setText(f"?꾩옱 ?뚯씪: {index} / {total} | {source_path}")
+        self.current_file_label.setText(f"현재 파일: {index} / {total} | {source_path}")
         self.stage_progress.setValue(0)
         self.translation_progress.setValue(0)
 
     def on_stage_changed(self, stage_title: str, stage_detail: str) -> None:
-        self.current_stage_label.setText(f"?꾩옱 ?④퀎: {stage_title} | {stage_detail}")
+        self.current_stage_label.setText(f"현재 단계: {stage_title} | {stage_detail}")
         self._stage_title = stage_title
         self._stage_detail = stage_detail
 
@@ -1170,16 +1183,16 @@ class MainWindow(QMainWindow):
         self.stage_progress.setValue(max(0, min(100, percent)))
         if duration > 0:
             detail = f"{self._stage_detail} | {position:.1f}s / {duration:.1f}s" if self._stage_detail else f"{position:.1f}s / {duration:.1f}s"
-            self.current_stage_label.setText(f"?꾩옱 ?④퀎: {self._stage_title} | {detail}")
+            self.current_stage_label.setText(f"현재 단계: {self._stage_title} | {detail}")
 
     def on_translation_progress_changed(self, chunk_index: int, chunk_total: int, key_display: str, model_name: str, error_count: int) -> None:
         percent = 0 if chunk_total <= 0 else int(chunk_index * 100 / chunk_total)
         self.translation_progress.setValue(max(0, min(100, percent)))
         if chunk_total <= 0:
-            self.translation_progress_label.setText("?? ??: ?? ?")
+            self.translation_progress_label.setText("번역 진행: 대기 중")
             return
         self.translation_progress_label.setText(
-            f"踰덉뿭 吏꾪뻾: 泥?겕 {chunk_index}/{chunk_total} | ??{key_display} | 紐⑤뜽 {model_name or '-'} | ?먮윭 {error_count}"
+            f"번역 진행: 청크 {chunk_index}/{chunk_total} | 키 {key_display} | 모델 {model_name or '-'} | 에러 {error_count}"
         )
 
     def on_pipeline_summary_ready(self, success_count: int, failure_count: int, skipped_count: int) -> None:
@@ -1187,10 +1200,10 @@ class MainWindow(QMainWindow):
         self._session_success_count += success_count
         self._session_failure_count += failure_count
         self._session_skipped_count += skipped_count
-        self.current_file_label.setText("?꾩옱 ?뚯씪: ?묒뾽 ?꾨즺")
-        self._stage_title = "?꾨즺"
+        self.current_file_label.setText("현재 파일: 작업 완료")
+        self._stage_title = "완료"
         self._stage_detail = ""
-        self.current_stage_label.setText("?꾩옱 ?④퀎: ?꾨즺")
+        self.current_stage_label.setText("현재 단계: 완료")
         self.stage_progress.setValue(100)
         self.translation_progress.setValue(100)
         self.refresh_queue_progress()
@@ -1200,19 +1213,19 @@ class MainWindow(QMainWindow):
         self.update_controls()
 
         summary = (
-            f"?묒뾽 ?꾨즺\n?깃났: {self._session_success_count}\n?ㅽ뙣: {self._session_failure_count}\n?ㅽ궢: {self._session_skipped_count}"
+            f"작업 완료\n성공: {self._session_success_count}\n실패: {self._session_failure_count}\n스킵: {self._session_skipped_count}"
         )
         self.log(summary.replace("\n", " | "))
         QMessageBox.information(self, APP_NAME, summary)
 
     def on_pipeline_failed(self, message: str) -> None:
         self._processing = False
-        self._stage_title = "?ㅽ뙣"
+        self._stage_title = "실패"
         self._stage_detail = message
-        self.current_stage_label.setText(f"?꾩옱 ?④퀎: ?ㅽ뙣 | {message}")
+        self.current_stage_label.setText(f"현재 단계: 실패 | {message}")
         self._queue_total = 0
         self._queue_processed = 0
-        self.log(f"?묒뾽 ?ㅽ뙣: {message}")
+        self.log(f"작업 실패: {message}")
         self.refresh_model_status()
         self.update_controls()
         QMessageBox.warning(self, APP_NAME, message)
