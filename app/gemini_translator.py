@@ -95,7 +95,7 @@ class GeminiTranslator:
 
         translated: dict[str, str] = {}
         for chunk_index, chunk in enumerate(chunks, start=1):
-            translated.update(self._translate_chunk(chunk, file_name, chunk_index, len(chunks)))
+            translated.update(self._translate_chunk_with_split(chunk, file_name, chunk_index, len(chunks)))
             on_chunk_progress(
                 chunk_index,
                 len(chunks),
@@ -104,6 +104,45 @@ class GeminiTranslator:
                 self.error_count,
             )
         return translated
+
+    def _translate_chunk_with_split(
+        self,
+        chunk,
+        file_name: str,
+        chunk_index: int,
+        chunk_total: int,
+        split_depth: int = 0,
+    ) -> dict[str, str]:
+        try:
+            return self._translate_chunk(chunk, file_name, chunk_index, chunk_total)
+        except TranslationError as exc:
+            if len(chunk) <= 1:
+                line_id = getattr(chunk[0], "line_id", "?") if chunk else "?"
+                self.log_callback(
+                    f"[{file_name}] chunk {chunk_index}/{chunk_total} | line {line_id} failed after split retries -> keeping source text ({exc})"
+                )
+                return {}
+
+            if not self._should_split_for_error(str(exc)):
+                self.log_callback(
+                    f"[{file_name}] chunk {chunk_index}/{chunk_total} | chunk failed without split fallback -> keeping source text for {len(chunk)} lines ({exc})"
+                )
+                return {}
+
+            midpoint = max(1, len(chunk) // 2)
+            left_chunk = chunk[:midpoint]
+            right_chunk = chunk[midpoint:]
+            self.log_callback(
+                f"[{file_name}] chunk {chunk_index}/{chunk_total} | splitting blocked chunk depth={split_depth + 1} size={len(chunk)} -> {len(left_chunk)} + {len(right_chunk)}"
+            )
+            translated: dict[str, str] = {}
+            translated.update(
+                self._translate_chunk_with_split(left_chunk, file_name, chunk_index, chunk_total, split_depth + 1)
+            )
+            translated.update(
+                self._translate_chunk_with_split(right_chunk, file_name, chunk_index, chunk_total, split_depth + 1)
+            )
+            return translated
 
     def _translate_chunk(self, chunk, file_name: str, chunk_index: int, chunk_total: int) -> dict[str, str]:
         payload = "\n".join(f'<p id="{record.line_id}">{record.text}</p>' for record in chunk)
@@ -162,6 +201,12 @@ class GeminiTranslator:
                 time.sleep(self.config.wait_seconds_when_exhausted)
                 continue
             raise TranslationError("No available Gemini key/model combination could complete the translation.")
+
+    def _should_split_for_error(self, message: str) -> bool:
+        lowered = message.lower()
+        if _is_quota_error(lowered):
+            return False
+        return True
 
     def _request_translation(self, api_key: str, model_name: str, system_prompt: str, user_prompt: str) -> str:
         genai.configure(api_key=api_key)
