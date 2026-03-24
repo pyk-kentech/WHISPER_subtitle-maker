@@ -573,11 +573,13 @@ class MainWindow(QMainWindow):
         self.tray_icon.show()
 
     def hide_to_tray(self) -> None:
+        if self.isMinimized():
+            self.showNormal()
         self.hide()
         if self.tray_icon is not None and not self._tray_message_shown:
             self.tray_icon.showMessage(
                 APP_NAME,
-                "The app keeps running in the system tray.",
+                "앱은 시스템 트레이에서 계속 실행됩니다.",
                 QSystemTrayIcon.Information,
                 3000,
             )
@@ -602,10 +604,6 @@ class MainWindow(QMainWindow):
         self.close()
 
     def changeEvent(self, event) -> None:
-        if event.type() == event.Type.WindowStateChange and self.isMinimized():
-            self.hide_to_tray()
-            event.ignore()
-            return
         super().changeEvent(event)
 
     def _build_translation_tab(self) -> QWidget:
@@ -650,6 +648,11 @@ class MainWindow(QMainWindow):
         self.model_edit.setPlaceholderText("비우면 자동 모델 순서 사용")
         self.model_edit.textChanged.connect(self.mark_translation_inputs_dirty)
         form.addRow("선호 모델", self.model_edit)
+
+        self.use_deepl_fallback_checkbox = QCheckBox("Gemini 실패 시 DeepL Free API 사용")
+        self.use_deepl_fallback_checkbox.setChecked(self._translator_settings.use_deepl_fallback)
+        self.use_deepl_fallback_checkbox.toggled.connect(self.mark_translation_inputs_dirty)
+        form.addRow("실패 폴백", self.use_deepl_fallback_checkbox)
 
         self.chunk_size_spin = QSpinBox()
         self.chunk_size_spin.setRange(10, 200)
@@ -807,6 +810,7 @@ class MainWindow(QMainWindow):
         return TranslatorSettings(
             preferred_model=self.model_edit.text().strip(),
             target_language=str(self.output_language_combo.currentData() or "ko"),
+            use_deepl_fallback=self.use_deepl_fallback_checkbox.isChecked(),
             chunk_size=self.chunk_size_spin.value(),
             request_delay_seconds=self.request_delay_spin.value(),
             temperature=self.temperature_spin.value(),
@@ -1117,9 +1121,13 @@ class MainWindow(QMainWindow):
     def start_pipeline(self) -> None:
         api_keys = load_api_keys()
         deepl_api_key = load_deepl_api_key()
-        if not api_keys and not deepl_api_key:
+        if not api_keys:
             self.tabs.setCurrentIndex(1)
-            QMessageBox.warning(self, APP_NAME, "번역 설정 탭에 Gemini API 키 또는 DeepL API 키를 입력해 주세요.")
+            QMessageBox.warning(self, APP_NAME, "번역 설정 탭에 Gemini API 키를 입력해 주세요.")
+            return
+        if self.translator_settings().use_deepl_fallback and not deepl_api_key:
+            self.tabs.setCurrentIndex(1)
+            QMessageBox.warning(self, APP_NAME, "DeepL 폴백을 사용하려면 DeepL Free API 키를 입력해 주세요.")
             return
         if not self._model_ready:
             self.log("모델 준비 전에는 작업을 시작할 수 없습니다.")

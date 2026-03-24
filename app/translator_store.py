@@ -23,6 +23,7 @@ from .credential_store import CredentialStoreError, delete_secret, load_secret, 
 class TranslatorSettings:
     preferred_model: str = ""
     target_language: str = DEFAULT_OUTPUT_LANGUAGE
+    use_deepl_fallback: bool = False
     chunk_size: int = DEFAULT_TRANSLATION_CHUNK_SIZE
     request_delay_seconds: float = DEFAULT_TRANSLATION_REQUEST_DELAY_SECONDS
     temperature: float = DEFAULT_TRANSLATION_TEMPERATURE
@@ -44,6 +45,7 @@ def load_translator_settings() -> TranslatorSettings:
     return TranslatorSettings(
         preferred_model=str(data.get("preferred_model", "")),
         target_language=str(data.get("target_language", DEFAULT_OUTPUT_LANGUAGE)),
+        use_deepl_fallback=bool(data.get("use_deepl_fallback", False)),
         chunk_size=int(data.get("chunk_size", DEFAULT_TRANSLATION_CHUNK_SIZE)),
         request_delay_seconds=float(data.get("request_delay_seconds", DEFAULT_TRANSLATION_REQUEST_DELAY_SECONDS)),
         temperature=float(data.get("temperature", DEFAULT_TRANSLATION_TEMPERATURE)),

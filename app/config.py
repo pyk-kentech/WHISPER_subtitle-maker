@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 
@@ -146,8 +147,25 @@ def get_project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def get_runtime_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return get_project_root()
+
+
 def get_preferred_icon_path() -> Path | None:
-    icon_files = sorted(get_project_root().glob("*.ico"))
+    icon_files = sorted(get_runtime_base_dir().glob("*.ico"))
+    if not icon_files and getattr(sys, "frozen", False):
+        icon_files = sorted(Path(sys.executable).resolve().parent.glob("*.ico"))
     if not icon_files:
         return None
     return icon_files[0]
+
+
+def get_font_paths() -> list[Path]:
+    base_dir = get_runtime_base_dir()
+    font_files = sorted(base_dir.glob("*.ttf")) + sorted(base_dir.glob("*.otf"))
+    if not font_files and getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        font_files = sorted(exe_dir.glob("*.ttf")) + sorted(exe_dir.glob("*.otf"))
+    return font_files

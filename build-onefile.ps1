@@ -3,7 +3,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
-$icon = Get-ChildItem -Path $root -Filter *.ico | Select-Object -First 1
+$icon = Get-ChildItem -Path $root -File -Filter *.ico | Select-Object -First 1
+$fontFiles = @(
+  Get-ChildItem -Path $root -File -Filter *.ttf
+  Get-ChildItem -Path $root -File -Filter *.otf
+) | Sort-Object Name -Unique
 $iconArgs = @()
 if ($icon) {
   $iconArgs = @("--icon", $icon.FullName)
@@ -34,6 +38,11 @@ $pyinstallerArgs = @(
 
 if ($iconArgs.Count -gt 0) {
   $pyinstallerArgs += $iconArgs
+  $pyinstallerArgs += @("--add-data", "$($icon.FullName);.")
+}
+
+foreach ($fontFile in $fontFiles) {
+  $pyinstallerArgs += @("--add-data", "$($fontFile.FullName);.")
 }
 
 $pyinstallerArgs += "launcher.py"

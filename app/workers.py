@@ -222,26 +222,27 @@ class PipelineWorker(QThread):
                 self.stage_changed.emit("환경 준비", "강화 후처리 사전 확인")
                 ensure_dictionary_pack(self._report_dictionary_progress, self.log_message.emit)
 
-            gemini_translator = None
-            if self.job.api_keys:
-                gemini_translator = GeminiTranslator(
-                    TranslationConfig(
-                        keys=self.job.api_keys,
-                        preferred_model=self.job.translator_settings.preferred_model,
-                        target_language=self.job.translator_settings.target_language,
-                        system_prompt=self.job.translator_settings.system_prompt,
-                        translation_note=self.job.translator_settings.translation_note,
-                        temperature=self.job.translator_settings.temperature,
-                        top_p=self.job.translator_settings.top_p,
-                        reasoning_level=self.job.translator_settings.reasoning_level,
-                        chunk_size=self.job.translator_settings.chunk_size,
-                        request_delay_seconds=self.job.translator_settings.request_delay_seconds,
-                    ),
-                    self.log_message.emit,
-                )
+            if not self.job.api_keys:
+                raise RuntimeError("번역용 Gemini API 키가 비어 있습니다. 번역 설정 탭에서 입력하세요.")
+
+            gemini_translator = GeminiTranslator(
+                TranslationConfig(
+                    keys=self.job.api_keys,
+                    preferred_model=self.job.translator_settings.preferred_model,
+                    target_language=self.job.translator_settings.target_language,
+                    system_prompt=self.job.translator_settings.system_prompt,
+                    translation_note=self.job.translator_settings.translation_note,
+                    temperature=self.job.translator_settings.temperature,
+                    top_p=self.job.translator_settings.top_p,
+                    reasoning_level=self.job.translator_settings.reasoning_level,
+                    chunk_size=self.job.translator_settings.chunk_size,
+                    request_delay_seconds=self.job.translator_settings.request_delay_seconds,
+                ),
+                self.log_message.emit,
+            )
 
             deepl_translator = None
-            if self.job.deepl_api_key:
+            if self.job.translator_settings.use_deepl_fallback and self.job.deepl_api_key:
                 deepl_translator = DeepLTranslator(
                     DeepLConfig(
                         api_key=self.job.deepl_api_key,
@@ -252,9 +253,6 @@ class PipelineWorker(QThread):
                     ),
                     self.log_message.emit,
                 )
-
-            if gemini_translator is None and deepl_translator is None:
-                raise RuntimeError("번역용 Gemini API 키 또는 DeepL API 키를 번역 설정 탭에 입력하세요.")
 
             runtime_config = build_runtime_config(self.job.runtime_device, self.job.runtime_tuning)
             engine = TranscriptionEngine(runtime_config, self.job.model_key)
@@ -277,12 +275,11 @@ class PipelineWorker(QThread):
 
                 source_path = Path(source_str)
                 output_path = source_path.with_suffix(".srt")
+                jp_output_path = source_path.with_suffix(".jp.srt")
                 self.file_started.emit(index, total, str(source_path))
                 self.stage_progress_changed.emit(0, 0.0, 0.0)
-                progress_key_display = (
-                    gemini_translator.current_key_display if gemini_translator is not None else deepl_translator.current_key_display
-                )
-                progress_error_count = gemini_translator.error_count if gemini_translator is not None else deepl_translator.error_count
+                progress_key_display = gemini_translator.current_key_display
+                progress_error_count = gemini_translator.error_count
                 self.translation_progress_changed.emit(0, 0, progress_key_display, "", progress_error_count)
 
                 try:
@@ -296,6 +293,15 @@ class PipelineWorker(QThread):
                         self.item_status_changed.emit(source_str, STATUS_SKIPPED, message)
                         self.log_message.emit(f"{source_path} | {message}")
                         self.stage_changed.emit("스킵", "기존 자막 파일 존재")
+                        self.stage_progress_changed.emit(100, 0.0, 0.0)
+                        continue
+                    if jp_output_path.exists():
+                        with self._counter_lock:
+                            self._skipped_count += 1
+                        message = "기존 일본어 자막 파일 존재 -> 스킵"
+                        self.item_status_changed.emit(source_str, STATUS_SKIPPED, message)
+                        self.log_message.emit(f"{source_path} | {message}")
+                        self.stage_changed.emit("스킵", "기존 일본어 자막 파일 존재")
                         self.stage_progress_changed.emit(100, 0.0, 0.0)
                         continue
 
@@ -349,43 +355,49 @@ class PipelineWorker(QThread):
                     records = document.get_translatable_records()
                     translated = None
                     gemini_error: str | None = None
+                    output_path = source_path.with_suffix(".srt")
 
-                    if gemini_translator is not None:
-                        try:
-                            translated = gemini_translator.translate_lines(
-                                records,
-                                self._make_translation_progress_callback(),
-                                source_path.name,
-                            )
-                        except TranslationError as exc:
-                            gemini_error = str(exc) or exc.__class__.__name__
-                            self.log_message.emit(
-                                f"{source_path.name} | Gemini 번역 후보를 모두 시도했지만 실패했습니다 -> {gemini_error}"
-                            )
-
-                    if translated is None:
-                        if deepl_translator is None:
-                            if gemini_error:
-                                raise RuntimeError(gemini_error)
-                            raise RuntimeError("사용 가능한 번역 공급자가 없습니다.")
-                        if gemini_error:
-                            self.stage_changed.emit("번역", "DeepL Free API 폴백")
-                            self.log_message.emit(f"{source_path.name} | DeepL Free API로 폴백합니다.")
-                        else:
-                            self.stage_changed.emit("번역", "DeepL Free API 번역")
-                        translated = deepl_translator.translate_lines(
+                    try:
+                        translated = gemini_translator.translate_lines(
                             records,
                             self._make_translation_progress_callback(),
                             source_path.name,
                         )
-                    self._pause_checkpoint("현재 파일 일시 중지됨")
-                    document.apply_translations(translated)
+                    except TranslationError as exc:
+                        gemini_error = str(exc) or exc.__class__.__name__
+                        self.log_message.emit(
+                            f"{source_path.name} | Gemini 번역 후보를 모두 시도했지만 실패했습니다 -> {gemini_error}"
+                        )
+
+                    if translated is None:
+                        if self.job.translator_settings.use_deepl_fallback:
+                            if deepl_translator is None:
+                                raise RuntimeError("DeepL 폴백이 활성화되었지만 API 키가 비어 있습니다.")
+                            self.stage_changed.emit("번역", "DeepL Free API 폴백")
+                            self.log_message.emit(f"{source_path.name} | DeepL Free API로 폴백합니다.")
+                            translated = deepl_translator.translate_lines(
+                                records,
+                                self._make_translation_progress_callback(),
+                                source_path.name,
+                            )
+                            self._pause_checkpoint("현재 파일 일시 중지됨")
+                            document.apply_translations(translated)
+                        else:
+                            output_path = jp_output_path
+                            self.stage_changed.emit("저장", "일본어 자막 저장")
+                            self.log_message.emit(
+                                f"{source_path.name} | Gemini 실패로 번역 없이 일본어 자막을 저장합니다 -> {output_path}"
+                            )
+                    else:
+                        self._pause_checkpoint("현재 파일 일시 중지됨")
+                        document.apply_translations(translated)
+
                     self.item_status_changed.emit(source_str, STATUS_SAVING, str(output_path))
                     self._enqueue_save(
                         SaveTask(
                             source_path=source_str,
                             output_path=output_path,
-                            content=document.render() + "\n",
+                            content=(document.render() if translated is not None else subtitle_text) + "\n",
                         )
                     )
                     self.log_message.emit(f"{source_path} | 저장 큐 등록 -> {output_path}")
