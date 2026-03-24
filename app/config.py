@@ -76,6 +76,8 @@ DEFAULT_TRANSLATION_MODELS = [
     "gemini-3-flash-preview",
     "gemini-2.5-flash-preview-09-2025",
     "gemini-2.5-flash",
+    "gemini-2.0-flash-exp",
+    "gemini-1.5-flash",
 ]
 DEEPL_FREE_API_URL = "https://api-free.deepl.com/v2/translate"
 DEFAULT_TRANSLATION_SYSTEM_PROMPT = """[공리]
