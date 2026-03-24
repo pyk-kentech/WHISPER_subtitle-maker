@@ -76,10 +76,19 @@ from .transcriber import (
     get_available_runtime_choices,
     get_default_runtime_choice,
     get_default_cpu_threads,
+    get_memory_profile_choices,
     get_max_worker_count,
     unload_loaded_models,
 )
-from .translator_store import TranslatorSettings, load_api_keys, load_translator_settings, save_api_keys, save_translator_settings
+from .translator_store import (
+    TranslatorSettings,
+    load_api_keys,
+    load_deepl_api_key,
+    load_translator_settings,
+    save_api_keys,
+    save_deepl_api_key,
+    save_translator_settings,
+)
 from .workers import ModelDownloadWorker, PipelineJob, PipelineWorker
 
 
@@ -273,6 +282,7 @@ class MainWindow(QMainWindow):
 
         self._translator_settings = load_translator_settings()
         self._saved_api_keys_text = "\n".join(load_api_keys())
+        self._saved_deepl_api_key = load_deepl_api_key()
         self._settings_dirty = False
         self._logger = get_logger()
         self.ui_log_signal.connect(self._append_ui_log)
@@ -375,6 +385,13 @@ class MainWindow(QMainWindow):
         self.num_workers_spin.setRange(1, get_max_worker_count())
         self.num_workers_spin.setValue(1)
         performance_row.addWidget(self.num_workers_spin)
+
+        performance_row.addWidget(QLabel("RAM 사용량"))
+        self.memory_profile_combo = QComboBox()
+        for value, label in get_memory_profile_choices():
+            self.memory_profile_combo.addItem(label, value)
+        self.memory_profile_combo.setCurrentIndex(max(0, self.memory_profile_combo.findData("unlimited")))
+        performance_row.addWidget(self.memory_profile_combo)
 
         self.auto_unload_checkbox = QCheckBox("작업 완료 후 모델 자동 해제")
         self.auto_unload_checkbox.setChecked(True)
@@ -609,12 +626,21 @@ class MainWindow(QMainWindow):
 
         api_box = QGroupBox("API 키")
         api_layout = QVBoxLayout(api_box)
-        api_layout.addWidget(QLabel("여러 키를 한 줄에 하나씩 입력하면 자동으로 순환 사용합니다."))
+        api_layout.addWidget(QLabel("Gemini 키는 여러 개를 한 줄에 하나씩 입력하면 자동으로 순환 사용합니다."))
+        api_layout.addWidget(QLabel("Gemini가 끝까지 실패하면 저장된 DeepL Free API 키로 자동 폴백합니다."))
+        api_layout.addWidget(QLabel("Gemini API 키"))
         self.keys_edit = QPlainTextEdit(self._saved_api_keys_text)
         self.keys_edit.setPlaceholderText("AIza...")
         self.keys_edit.setMinimumHeight(140)
         self.keys_edit.textChanged.connect(self.mark_translation_inputs_dirty)
         api_layout.addWidget(self.keys_edit)
+
+        api_layout.addWidget(QLabel("DeepL Free API 키"))
+        self.deepl_key_edit = QLineEdit(self._saved_deepl_api_key)
+        self.deepl_key_edit.setPlaceholderText("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx")
+        self.deepl_key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
+        self.deepl_key_edit.textChanged.connect(self.mark_translation_inputs_dirty)
+        api_layout.addWidget(self.deepl_key_edit)
         layout.addWidget(CollapsibleSection("API Keys", api_box, expanded=True))
 
         option_box = QGroupBox("Gemini 번역 옵션")
@@ -770,6 +796,7 @@ class MainWindow(QMainWindow):
             compute_type=str(self.compute_type_combo.currentData() or "auto"),
             cpu_threads=cpu_threads,
             num_workers=self.num_workers_spin.value(),
+            memory_profile=str(self.memory_profile_combo.currentData() or "unlimited"),
             auto_unload_after_job=self.auto_unload_checkbox.isChecked(),
         )
 
@@ -799,9 +826,11 @@ class MainWindow(QMainWindow):
 
     def save_translation_inputs(self) -> None:
         self._saved_api_keys_text = self.keys_edit.toPlainText()
+        self._saved_deepl_api_key = self.deepl_key_edit.text().strip()
         self._translator_settings = self.collect_translation_inputs()
         try:
             save_api_keys(self._saved_api_keys_text)
+            save_deepl_api_key(self._saved_deepl_api_key)
             save_translator_settings(self._translator_settings)
         except CredentialStoreError as exc:
             self.log(f"API 키 보안 저장 실패: {exc}", logging.ERROR)
@@ -885,6 +914,7 @@ class MainWindow(QMainWindow):
         self.compute_type_combo.setEnabled(enabled)
         self.cpu_threads_spin.setEnabled(enabled and self.current_runtime_device() == "cpu")
         self.num_workers_spin.setEnabled(enabled)
+        self.memory_profile_combo.setEnabled(enabled)
         self.auto_unload_checkbox.setEnabled(True)
         self.vad_checkbox.setEnabled(enabled)
         self.vad_min_silence_spin.setEnabled(enabled and self.vad_checkbox.isChecked())
@@ -1086,9 +1116,10 @@ class MainWindow(QMainWindow):
 
     def start_pipeline(self) -> None:
         api_keys = load_api_keys()
-        if not api_keys:
+        deepl_api_key = load_deepl_api_key()
+        if not api_keys and not deepl_api_key:
             self.tabs.setCurrentIndex(1)
-            QMessageBox.warning(self, APP_NAME, "번역 설정 탭에 Gemini API 키를 입력해 주세요.")
+            QMessageBox.warning(self, APP_NAME, "번역 설정 탭에 Gemini API 키 또는 DeepL API 키를 입력해 주세요.")
             return
         if not self._model_ready:
             self.log("모델 준비 전에는 작업을 시작할 수 없습니다.")
@@ -1127,6 +1158,7 @@ class MainWindow(QMainWindow):
             enable_enhanced_postprocess=self.enhanced_postprocess_checkbox.isChecked(),
             translator_settings=self.translator_settings(),
             api_keys=api_keys,
+            deepl_api_key=deepl_api_key,
         )
         self._pipeline_worker = PipelineWorker(job, self)
         self._pipeline_worker.item_status_changed.connect(self.update_item_status)

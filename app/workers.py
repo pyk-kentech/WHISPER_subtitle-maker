@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from .cuda_runtime import ensure_cuda_runtime
+from .deepl_translator import DeepLConfig, DeepLTranslator
 from .dictionary_pack import ensure_dictionary_pack
 from .file_queue import (
     STATUS_DONE,
@@ -21,7 +22,7 @@ from .file_queue import (
     STATUS_TRANSCRIBING,
     STATUS_TRANSLATING,
 )
-from .gemini_translator import GeminiTranslator, TranslationConfig
+from .gemini_translator import GeminiTranslator, TranslationConfig, TranslationError
 from .japanese_postprocess import PostprocessOptions, postprocess_japanese_segments
 from .model_manager import download_model, get_download_plan, get_model_dir, is_model_ready
 from .srt_writer import build_srt_text, write_srt_text
@@ -65,6 +66,7 @@ class PipelineJob:
     enable_enhanced_postprocess: bool
     translator_settings: TranslatorSettings
     api_keys: list[str]
+    deepl_api_key: str
 
 
 @dataclass(slots=True)
@@ -220,24 +222,39 @@ class PipelineWorker(QThread):
                 self.stage_changed.emit("환경 준비", "강화 후처리 사전 확인")
                 ensure_dictionary_pack(self._report_dictionary_progress, self.log_message.emit)
 
-            if not self.job.api_keys:
-                raise RuntimeError("번역용 Gemini API 키가 비어 있습니다. 번역 설정 탭에서 입력하세요.")
+            gemini_translator = None
+            if self.job.api_keys:
+                gemini_translator = GeminiTranslator(
+                    TranslationConfig(
+                        keys=self.job.api_keys,
+                        preferred_model=self.job.translator_settings.preferred_model,
+                        target_language=self.job.translator_settings.target_language,
+                        system_prompt=self.job.translator_settings.system_prompt,
+                        translation_note=self.job.translator_settings.translation_note,
+                        temperature=self.job.translator_settings.temperature,
+                        top_p=self.job.translator_settings.top_p,
+                        reasoning_level=self.job.translator_settings.reasoning_level,
+                        chunk_size=self.job.translator_settings.chunk_size,
+                        request_delay_seconds=self.job.translator_settings.request_delay_seconds,
+                    ),
+                    self.log_message.emit,
+                )
 
-            translator = GeminiTranslator(
-                TranslationConfig(
-                    keys=self.job.api_keys,
-                    preferred_model=self.job.translator_settings.preferred_model,
-                    target_language=self.job.translator_settings.target_language,
-                    system_prompt=self.job.translator_settings.system_prompt,
-                    translation_note=self.job.translator_settings.translation_note,
-                    temperature=self.job.translator_settings.temperature,
-                    top_p=self.job.translator_settings.top_p,
-                    reasoning_level=self.job.translator_settings.reasoning_level,
-                    chunk_size=self.job.translator_settings.chunk_size,
-                    request_delay_seconds=self.job.translator_settings.request_delay_seconds,
-                ),
-                self.log_message.emit,
-            )
+            deepl_translator = None
+            if self.job.deepl_api_key:
+                deepl_translator = DeepLTranslator(
+                    DeepLConfig(
+                        api_key=self.job.deepl_api_key,
+                        target_language=self.job.translator_settings.target_language,
+                        source_language=self.job.source_language,
+                        chunk_size=self.job.translator_settings.chunk_size,
+                        request_delay_seconds=self.job.translator_settings.request_delay_seconds,
+                    ),
+                    self.log_message.emit,
+                )
+
+            if gemini_translator is None and deepl_translator is None:
+                raise RuntimeError("번역용 Gemini API 키 또는 DeepL API 키를 번역 설정 탭에 입력하세요.")
 
             runtime_config = build_runtime_config(self.job.runtime_device, self.job.runtime_tuning)
             engine = TranscriptionEngine(runtime_config, self.job.model_key)
@@ -262,7 +279,11 @@ class PipelineWorker(QThread):
                 output_path = source_path.with_suffix(".srt")
                 self.file_started.emit(index, total, str(source_path))
                 self.stage_progress_changed.emit(0, 0.0, 0.0)
-                self.translation_progress_changed.emit(0, 0, translator.current_key_display, "", translator.error_count)
+                progress_key_display = (
+                    gemini_translator.current_key_display if gemini_translator is not None else deepl_translator.current_key_display
+                )
+                progress_error_count = gemini_translator.error_count if gemini_translator is not None else deepl_translator.error_count
+                self.translation_progress_changed.emit(0, 0, progress_key_display, "", progress_error_count)
 
                 try:
                     if not source_path.exists():
@@ -325,11 +346,38 @@ class PipelineWorker(QThread):
                     self.item_status_changed.emit(source_str, STATUS_TRANSLATING, "")
                     self.stage_changed.emit("번역", "자막 번역")
                     document = load_subtitle_document_from_text(".srt", subtitle_text)
-                    translated = translator.translate_lines(
-                        document.get_translatable_records(),
-                        self._make_translation_progress_callback(),
-                        source_path.name,
-                    )
+                    records = document.get_translatable_records()
+                    translated = None
+                    gemini_error: str | None = None
+
+                    if gemini_translator is not None:
+                        try:
+                            translated = gemini_translator.translate_lines(
+                                records,
+                                self._make_translation_progress_callback(),
+                                source_path.name,
+                            )
+                        except TranslationError as exc:
+                            gemini_error = str(exc) or exc.__class__.__name__
+                            self.log_message.emit(
+                                f"{source_path.name} | Gemini 번역 후보를 모두 시도했지만 실패했습니다 -> {gemini_error}"
+                            )
+
+                    if translated is None:
+                        if deepl_translator is None:
+                            if gemini_error:
+                                raise RuntimeError(gemini_error)
+                            raise RuntimeError("사용 가능한 번역 공급자가 없습니다.")
+                        if gemini_error:
+                            self.stage_changed.emit("번역", "DeepL Free API 폴백")
+                            self.log_message.emit(f"{source_path.name} | DeepL Free API로 폴백합니다.")
+                        else:
+                            self.stage_changed.emit("번역", "DeepL Free API 번역")
+                        translated = deepl_translator.translate_lines(
+                            records,
+                            self._make_translation_progress_callback(),
+                            source_path.name,
+                        )
                     self._pause_checkpoint("현재 파일 일시 중지됨")
                     document.apply_translations(translated)
                     self.item_status_changed.emit(source_str, STATUS_SAVING, str(output_path))
@@ -355,6 +403,10 @@ class PipelineWorker(QThread):
                     self.log_message.emit(f"{source_path} | 실패 -> {message}")
                     self.stage_changed.emit("실패", message)
                 finally:
+                    if self.job.runtime_tuning.memory_profile == "strict":
+                        unloaded = unload_loaded_models(self.job.model_key)
+                        if unloaded > 0:
+                            self.log_message.emit("강한 절약 모드로 현재 파일 처리 후 모델을 메모리에서 해제했습니다.")
                     self._complete_current()
 
             self._wait_for_save_completion()

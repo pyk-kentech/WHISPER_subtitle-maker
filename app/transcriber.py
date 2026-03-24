@@ -26,6 +26,11 @@ except Exception:  # pragma: no cover
 
 CPU_COMPUTE_TYPE_OPTIONS = ["auto", "int8", "int8_float32", "float32"]
 CUDA_COMPUTE_TYPE_OPTIONS = ["auto", "float16", "int8_float16", "int8_float32", "float32"]
+MEMORY_PROFILE_OPTIONS = [
+    ("unlimited", "제한 없음 (기본)"),
+    ("save", "절약"),
+    ("strict", "강한 절약"),
+]
 
 
 @dataclass(slots=True)
@@ -34,6 +39,7 @@ class RuntimeConfig:
     compute_type: str
     cpu_threads: int
     num_workers: int
+    memory_profile: str
     label: str
 
 
@@ -49,6 +55,7 @@ class RuntimeTuningOptions:
     compute_type: str = "auto"
     cpu_threads: int | None = None
     num_workers: int = 1
+    memory_profile: str = "unlimited"
     auto_unload_after_job: bool = True
 
 
@@ -125,6 +132,10 @@ def get_compute_type_choices(device: str) -> list[tuple[str, str]]:
     return [(item, item) for item in options]
 
 
+def get_memory_profile_choices() -> list[tuple[str, str]]:
+    return list(MEMORY_PROFILE_OPTIONS)
+
+
 def get_default_cpu_threads() -> int:
     cpu_count = os.cpu_count() or 4
     return max(1, min(cpu_count - 1, 8))
@@ -138,7 +149,10 @@ def build_runtime_config(device: str, options: RuntimeTuningOptions | None = Non
     normalized = device.lower().strip()
     tuning = options or RuntimeTuningOptions()
     selected_compute_type = tuning.compute_type.strip().lower() or "auto"
+    memory_profile = tuning.memory_profile.strip().lower() or "unlimited"
     selected_workers = max(1, int(tuning.num_workers))
+    if memory_profile in {"save", "strict"}:
+        selected_workers = 1
 
     if normalized == "cuda":
         available, reason = is_cuda_runtime_available()
@@ -149,6 +163,10 @@ def build_runtime_config(device: str, options: RuntimeTuningOptions | None = Non
         preferred_order = ["float16", "int8_float16", "int8_float32", "float32"]
         if selected_compute_type != "auto":
             preferred_order = [selected_compute_type]
+        elif memory_profile == "save":
+            preferred_order = ["int8_float16", "float16", "int8_float32", "float32"]
+        elif memory_profile == "strict":
+            preferred_order = ["int8_float16", "int8_float32", "float16", "float32"]
 
         for compute_type in preferred_order:
             if compute_type in supported:
@@ -157,7 +175,8 @@ def build_runtime_config(device: str, options: RuntimeTuningOptions | None = Non
                     compute_type=compute_type,
                     cpu_threads=0,
                     num_workers=selected_workers,
-                    label=f"GPU (CUDA, {compute_type}, workers={selected_workers})",
+                    memory_profile=memory_profile,
+                    label=f"GPU (CUDA, {compute_type}, workers={selected_workers}, mem={memory_profile})",
                 )
         raise RuntimeError("No compatible GPU compute type was found.")
 
@@ -168,6 +187,10 @@ def build_runtime_config(device: str, options: RuntimeTuningOptions | None = Non
 
     cpu_threads = tuning.cpu_threads if tuning.cpu_threads is not None else get_default_cpu_threads()
     cpu_threads = max(1, int(cpu_threads))
+    if memory_profile == "save":
+        cpu_threads = min(cpu_threads, 4)
+    elif memory_profile == "strict":
+        cpu_threads = min(cpu_threads, 2)
     for compute_type in preferred_order:
         if compute_type in supported:
             return RuntimeConfig(
@@ -175,7 +198,8 @@ def build_runtime_config(device: str, options: RuntimeTuningOptions | None = Non
                 compute_type=compute_type,
                 cpu_threads=cpu_threads,
                 num_workers=selected_workers,
-                label=f"CPU ({compute_type}, threads={cpu_threads}, workers={selected_workers})",
+                memory_profile=memory_profile,
+                label=f"CPU ({compute_type}, threads={cpu_threads}, workers={selected_workers}, mem={memory_profile})",
             )
     raise RuntimeError("No compatible CPU compute type was found.")
 
@@ -288,20 +312,32 @@ class TranscriptionEngine:
         model = self._load_model()
         media_duration = self.get_media_duration(source_path)
         vad = vad_settings or VADSettings()
+        memory_profile = self.runtime_config.memory_profile
         vad_parameters = {
             "min_silence_duration_ms": max(0, int(vad.min_silence_duration_ms)),
             "speech_pad_ms": max(0, int(vad.speech_pad_ms)),
         }
 
+        beam_size = 5 if self.runtime_config.device == "cuda" else 3
+        chunk_length = 30
+        condition_on_previous_text = True
+        if memory_profile == "save":
+            beam_size = 3 if self.runtime_config.device == "cuda" else 2
+            chunk_length = 20
+        elif memory_profile == "strict":
+            beam_size = 2 if self.runtime_config.device == "cuda" else 1
+            chunk_length = 15
+            condition_on_previous_text = False
+
         segments, _ = model.transcribe(
             str(source_path),
             language=language_code,
             task="transcribe",
-            beam_size=5 if self.runtime_config.device == "cuda" else 3,
+            beam_size=beam_size,
             vad_filter=bool(vad.enabled),
             vad_parameters=vad_parameters,
-            condition_on_previous_text=True,
-            chunk_length=30,
+            condition_on_previous_text=condition_on_previous_text,
+            chunk_length=chunk_length,
         )
 
         result: list[SubtitleSegment] = []

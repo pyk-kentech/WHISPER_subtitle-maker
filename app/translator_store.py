@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 
 from .config import (
     API_KEYS_CREDENTIAL_NAME,
+    DEEPL_API_KEY_CREDENTIAL_NAME,
     DEFAULT_OUTPUT_LANGUAGE,
     DEFAULT_TRANSLATION_CHUNK_SIZE,
     DEFAULT_TRANSLATION_REQUEST_DELAY_SECONDS,
@@ -93,3 +94,18 @@ def save_api_keys(keys_text: str) -> None:
         delete_secret(API_KEYS_CREDENTIAL_NAME)
     if path.exists():
         path.unlink(missing_ok=True)
+
+
+def load_deepl_api_key() -> str:
+    try:
+        return load_secret(DEEPL_API_KEY_CREDENTIAL_NAME).strip()
+    except CredentialStoreError:
+        return ""
+
+
+def save_deepl_api_key(api_key: str) -> None:
+    normalized = api_key.strip()
+    if normalized:
+        save_secret(DEEPL_API_KEY_CREDENTIAL_NAME, normalized)
+    else:
+        delete_secret(DEEPL_API_KEY_CREDENTIAL_NAME)

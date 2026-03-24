@@ -7,6 +7,7 @@ from pathlib import Path
 APP_NAME = "Dongeum Sub Maker"
 APP_AUTHOR = "Codex"
 API_KEYS_CREDENTIAL_NAME = "DongeumSubMaker/GeminiApiKeys"
+DEEPL_API_KEY_CREDENTIAL_NAME = "DongeumSubMaker/DeepLApiKey"
 
 MODEL_PRESETS = {
     "tiny": {
@@ -75,6 +76,7 @@ DEFAULT_TRANSLATION_MODELS = [
     "gemini-2.5-flash-preview-09-2025",
     "gemini-2.5-flash",
 ]
+DEEPL_FREE_API_URL = "https://api-free.deepl.com/v2/translate"
 DEFAULT_TRANSLATION_SYSTEM_PROMPT = """[공리]
 입력: 원문 섹션이 주어짐. 번역 섹션이 함께 주어질 수도 있으며, 기존 번역문이므로 그 다음 줄부터 마저 번역.
 출력: 다른 어떠한 응답도 없이 한국어 번역 결과만을 즉시 제공. HTML 구조를 훼손하거나 삭제하지 않고 그대로 유지. 반드시 </main>으로 종료.
