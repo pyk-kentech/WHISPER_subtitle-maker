@@ -26,7 +26,7 @@ from .gemini_translator import GeminiTranslator, TranslationConfig, TranslationE
 from .japanese_postprocess import PostprocessOptions, postprocess_japanese_segments
 from .model_manager import download_model, get_download_plan, get_model_dir, is_model_ready
 from .srt_writer import build_srt_text, write_srt_text
-from .subtitle_document import load_subtitle_document_from_text
+from .subtitle_document import load_subtitle_document, load_subtitle_document_from_text
 from .transcriber import (
     RuntimeTuningOptions,
     TranscriptionEngine,
@@ -64,6 +64,15 @@ class PipelineJob:
     vad_settings: VADSettings
     enable_postprocess: bool
     enable_enhanced_postprocess: bool
+    translator_settings: TranslatorSettings
+    api_keys: list[str]
+    deepl_api_key: str
+
+
+@dataclass(slots=True)
+class SubtitleTranslationJob:
+    source_paths: list[str]
+    source_language: str
     translator_settings: TranslatorSettings
     api_keys: list[str]
     deepl_api_key: str
@@ -431,6 +440,191 @@ class PipelineWorker(QThread):
             self._wait_for_save_completion()
             if self.job.runtime_tuning.auto_unload_after_job:
                 unload_loaded_models(self.job.model_key)
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+
+
+def build_translated_subtitle_output_path(source_path: Path, language_code: str) -> Path:
+    normalized = language_code.strip().lower() or "translated"
+    return source_path.with_name(f"{source_path.stem}.{normalized}{source_path.suffix}")
+
+
+def build_japanese_subtitle_output_path(source_path: Path) -> Path:
+    return source_path.with_name(f"{source_path.stem}.jp{source_path.suffix}")
+
+
+class SubtitleTranslationWorker(QThread):
+    item_status_changed = Signal(str, str, str)
+    log_message = Signal(str)
+    queue_progress_changed = Signal(int, int)
+    file_started = Signal(int, int, str)
+    stage_changed = Signal(str, str)
+    translation_progress_changed = Signal(int, int, str, str, int)
+    summary_ready = Signal(int, int, int)
+    failed = Signal(str)
+
+    def __init__(self, job: SubtitleTranslationJob, parent=None) -> None:
+        super().__init__(parent)
+        self.job = job
+        self._pending_paths = deque(job.source_paths)
+        self._queued_paths = set(job.source_paths)
+        self._current_path: str | None = None
+        self._processed = 0
+        self._success_count = 0
+        self._failure_count = 0
+        self._skipped_count = 0
+
+    def add_paths(self, paths: list[str]) -> int:
+        added = 0
+        for path in paths:
+            if path in self._queued_paths or path == self._current_path:
+                continue
+            self._pending_paths.append(path)
+            self._queued_paths.add(path)
+            added += 1
+        if added:
+            self.queue_progress_changed.emit(self._processed, self._processed + len(self._pending_paths) + (1 if self._current_path else 0))
+        return added
+
+    def remove_paths(self, paths: list[str]) -> tuple[list[str], list[str]]:
+        removed: list[str] = []
+        blocked: list[str] = []
+        keep: list[str] = []
+        for path in list(self._pending_paths):
+            if path in paths:
+                removed.append(path)
+                self._queued_paths.discard(path)
+            else:
+                keep.append(path)
+        for path in paths:
+            if path == self._current_path:
+                blocked.append(path)
+        self._pending_paths = deque(keep)
+        if removed:
+            self.queue_progress_changed.emit(self._processed, self._processed + len(self._pending_paths) + (1 if self._current_path else 0))
+        return removed, blocked
+
+    def run(self) -> None:
+        try:
+            if not self.job.api_keys:
+                raise RuntimeError("번역용 Gemini API 키가 비어 있습니다. 번역 설정 탭에서 입력하세요.")
+
+            gemini_translator = GeminiTranslator(
+                TranslationConfig(
+                    keys=self.job.api_keys,
+                    preferred_model=self.job.translator_settings.preferred_model,
+                    target_language=self.job.translator_settings.target_language,
+                    system_prompt=self.job.translator_settings.system_prompt,
+                    translation_note=self.job.translator_settings.translation_note,
+                    temperature=self.job.translator_settings.temperature,
+                    top_p=self.job.translator_settings.top_p,
+                    reasoning_level=self.job.translator_settings.reasoning_level,
+                    chunk_size=self.job.translator_settings.chunk_size,
+                    request_delay_seconds=self.job.translator_settings.request_delay_seconds,
+                ),
+                self.log_message.emit,
+            )
+
+            deepl_translator = None
+            if self.job.translator_settings.use_deepl_fallback and self.job.deepl_api_key:
+                deepl_translator = DeepLTranslator(
+                    DeepLConfig(
+                        api_key=self.job.deepl_api_key,
+                        target_language=self.job.translator_settings.target_language,
+                        source_language=self.job.source_language,
+                        chunk_size=self.job.translator_settings.chunk_size,
+                        request_delay_seconds=self.job.translator_settings.request_delay_seconds,
+                    ),
+                    self.log_message.emit,
+                )
+
+            while self._pending_paths:
+                source_str = self._pending_paths.popleft()
+                self._current_path = source_str
+                source_path = Path(source_str)
+                output_path = build_translated_subtitle_output_path(source_path, self.job.translator_settings.target_language)
+                jp_output_path = build_japanese_subtitle_output_path(source_path)
+                total = self._processed + len(self._pending_paths) + 1
+                index = self._processed + 1
+                self.file_started.emit(index, total, source_str)
+                self.translation_progress_changed.emit(0, 0, gemini_translator.current_key_display, "", gemini_translator.error_count)
+
+                try:
+                    if not source_path.exists():
+                        raise FileNotFoundError("입력 자막 파일을 찾을 수 없습니다.")
+                    if output_path.exists():
+                        self._skipped_count += 1
+                        message = "기존 번역 자막 파일 존재 -> 스킵"
+                        self.item_status_changed.emit(source_str, STATUS_SKIPPED, message)
+                        self.log_message.emit(f"{source_path} | {message}")
+                        self.stage_changed.emit("스킵", "기존 번역 자막 파일 존재")
+                        continue
+                    if jp_output_path.exists():
+                        self._skipped_count += 1
+                        message = "기존 일본어 자막 파일 존재 -> 스킵"
+                        self.item_status_changed.emit(source_str, STATUS_SKIPPED, message)
+                        self.log_message.emit(f"{source_path} | {message}")
+                        self.stage_changed.emit("스킵", "기존 일본어 자막 파일 존재")
+                        continue
+
+                    self.item_status_changed.emit(source_str, STATUS_TRANSLATING, "")
+                    self.stage_changed.emit("번역", "자막 번역")
+                    document = load_subtitle_document(source_path)
+                    records = document.get_translatable_records()
+                    translated = None
+
+                    try:
+                        translated = gemini_translator.translate_lines(
+                            records,
+                            self.translation_progress_changed.emit,
+                            source_path.name,
+                        )
+                    except TranslationError as exc:
+                        self.log_message.emit(
+                            f"{source_path.name} | Gemini 번역 후보를 모두 시도했지만 실패했습니다 -> {str(exc) or exc.__class__.__name__}"
+                        )
+
+                    if translated is None:
+                        if self.job.translator_settings.use_deepl_fallback:
+                            if deepl_translator is None:
+                                raise RuntimeError("DeepL 폴백이 활성화되었지만 API 키가 비어 있습니다.")
+                            self.stage_changed.emit("번역", "DeepL Free API 폴백")
+                            self.log_message.emit(f"{source_path.name} | DeepL Free API로 폴백합니다.")
+                            translated = deepl_translator.translate_lines(
+                                records,
+                                self.translation_progress_changed.emit,
+                                source_path.name,
+                            )
+                            document.apply_translations(translated)
+                        else:
+                            output_path = jp_output_path
+                            self.stage_changed.emit("저장", "일본어 자막 저장")
+                            self.log_message.emit(
+                                f"{source_path.name} | Gemini 실패로 번역 없이 일본어 자막을 저장합니다 -> {output_path}"
+                            )
+                    else:
+                        document.apply_translations(translated)
+
+                    self.item_status_changed.emit(source_str, STATUS_SAVING, str(output_path))
+                    write_srt_text(output_path, document.render() + "\n")
+                    self._success_count += 1
+                    self.item_status_changed.emit(source_str, STATUS_DONE, str(output_path))
+                    self.log_message.emit(f"{source_path} | 완료 -> {output_path}")
+                    self.stage_changed.emit("저장", "자막 저장 완료")
+                except Exception as exc:
+                    self._failure_count += 1
+                    message = str(exc) or exc.__class__.__name__
+                    self.item_status_changed.emit(source_str, STATUS_FAILED, message)
+                    self.log_message.emit(f"{source_path} | 실패 -> {message}")
+                    self.stage_changed.emit("실패", message)
+                finally:
+                    if self._current_path is not None:
+                        self._queued_paths.discard(self._current_path)
+                        self._current_path = None
+                        self._processed += 1
+                    self.queue_progress_changed.emit(self._processed, self._processed + len(self._pending_paths))
+
+            self.summary_ready.emit(self._success_count, self._failure_count, self._skipped_count)
+        except Exception as exc:
             self.failed.emit(str(exc) or exc.__class__.__name__)
 
     def _next_source(self) -> tuple[str | None, int, int]:

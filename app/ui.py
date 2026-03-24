@@ -65,6 +65,7 @@ from .file_queue import (
     STATUS_TRANSCRIBING,
     STATUS_TRANSLATING,
     normalize_input_files,
+    normalize_translation_files,
 )
 from .credential_store import CredentialStoreError
 from .model_manager import get_model_dir, get_model_label, is_model_ready
@@ -89,7 +90,13 @@ from .translator_store import (
     save_deepl_api_key,
     save_translator_settings,
 )
-from .workers import ModelDownloadWorker, PipelineJob, PipelineWorker
+from .workers import (
+    ModelDownloadWorker,
+    PipelineJob,
+    PipelineWorker,
+    SubtitleTranslationJob,
+    SubtitleTranslationWorker,
+)
 
 
 GREEN_BAR_STYLE = """
@@ -143,7 +150,7 @@ DROP_TABLE_ACTIVE_STYLE = (
 class DropArea(QFrame):
     files_dropped = Signal(list)
 
-    def __init__(self) -> None:
+    def __init__(self, label_text: str = "여기에 .mp3 / .mp4 파일을 드래그 앤 드롭") -> None:
         super().__init__()
         self.setAcceptDrops(True)
         self.setFrameShape(QFrame.StyledPanel)
@@ -157,7 +164,7 @@ class DropArea(QFrame):
         )
 
         layout = QVBoxLayout(self)
-        label = QLabel("여기에 .mp3 / .mp4 파일을 드래그 앤 드롭")
+        label = QLabel(label_text)
         label.setAlignment(Qt.AlignCenter)
         label.setMinimumHeight(220)
         label.setWordWrap(True)
@@ -266,19 +273,28 @@ class MainWindow(QMainWindow):
         self._rows_by_path: dict[str, int] = {}
         self._download_worker: ModelDownloadWorker | None = None
         self._pipeline_worker: PipelineWorker | None = None
+        self._subtitle_translation_worker: SubtitleTranslationWorker | None = None
         self._model_ready = False
         self._processing = False
+        self._subtitle_translation_processing = False
         self._session_success_count = 0
         self._session_failure_count = 0
         self._session_skipped_count = 0
+        self._subtitle_success_count = 0
+        self._subtitle_failure_count = 0
+        self._subtitle_skipped_count = 0
         self._allow_close = False
         self._tray_message_shown = False
         self.tray_icon: QSystemTrayIcon | None = None
         self._queue_total = 0
         self._queue_processed = 0
+        self._subtitle_queue_total = 0
+        self._subtitle_queue_processed = 0
         self._current_file_prefix = "현재 파일: 없음"
         self._stage_title = "대기 중"
         self._stage_detail = ""
+        self._subtitle_items: dict[str, QueueItem] = {}
+        self._subtitle_rows_by_path: dict[str, int] = {}
 
         self._translator_settings = load_translator_settings()
         self._saved_api_keys_text = "\n".join(load_api_keys())
@@ -303,6 +319,7 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_main_tab(), "작업")
+        self.tabs.addTab(self._build_subtitle_translate_tab(), "자막 번역")
         self.tabs.addTab(self._build_translation_tab(), "번역 설정")
         root_layout.addWidget(self.tabs, 1)
 
@@ -606,6 +623,112 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
 
+    def _build_subtitle_translate_tab(self) -> QWidget:
+        content = QWidget()
+        root_layout = QVBoxLayout(content)
+        root_layout.setSpacing(10)
+
+        info_row = QHBoxLayout()
+        self.subtitle_translate_info_label = QLabel("입력 언어와 출력 언어는 작업 탭의 현재 설정을 사용합니다.")
+        self.subtitle_translate_info_label.setStyleSheet("color: #43556a;")
+        info_row.addWidget(self.subtitle_translate_info_label)
+        info_row.addStretch(1)
+        root_layout.addLayout(info_row)
+
+        button_row = QHBoxLayout()
+        self.subtitle_add_button = QPushButton("자막 파일 추가")
+        self.subtitle_add_button.clicked.connect(self.open_subtitle_file_dialog)
+        button_row.addWidget(self.subtitle_add_button)
+
+        self.subtitle_add_folder_button = QPushButton("자막 폴더 추가")
+        self.subtitle_add_folder_button.clicked.connect(self.open_subtitle_folder_dialog)
+        button_row.addWidget(self.subtitle_add_folder_button)
+
+        self.subtitle_include_subdirs_checkbox = QCheckBox("하위 폴더 포함")
+        self.subtitle_include_subdirs_checkbox.setChecked(True)
+        button_row.addWidget(self.subtitle_include_subdirs_checkbox)
+
+        self.subtitle_remove_button = QPushButton("선택 제거")
+        self.subtitle_remove_button.clicked.connect(self.remove_selected_subtitle_files)
+        button_row.addWidget(self.subtitle_remove_button)
+
+        self.subtitle_start_button = QPushButton("번역 시작")
+        self.subtitle_start_button.clicked.connect(self.start_subtitle_translation)
+        button_row.addWidget(self.subtitle_start_button)
+        button_row.addStretch(1)
+        root_layout.addLayout(button_row)
+
+        splitter = QSplitter(Qt.Vertical)
+        root_layout.addWidget(splitter, 1)
+
+        self.subtitle_drop_area = DropArea("여기에 .srt / .vtt / .txt 파일을 드래그 앤 드롭")
+        self.subtitle_drop_area.files_dropped.connect(self.add_subtitle_files)
+
+        self.subtitle_table = DropTableWidget(0, 3)
+        self.subtitle_table.files_dropped.connect(self.add_subtitle_files)
+        self.subtitle_table.setHorizontalHeaderLabels(["파일명", "전체 경로", "상태"])
+        self.subtitle_table.horizontalHeader().setStretchLastSection(False)
+        self.subtitle_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.subtitle_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.subtitle_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.subtitle_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.subtitle_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.subtitle_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.subtitle_table.setAlternatingRowColors(True)
+        self.subtitle_table.setTextElideMode(Qt.ElideMiddle)
+        self.subtitle_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.subtitle_table.setShowGrid(False)
+
+        self.subtitle_list_stack_host = QWidget()
+        self.subtitle_list_stack = QStackedLayout(self.subtitle_list_stack_host)
+        self.subtitle_list_stack.setContentsMargins(0, 0, 0, 0)
+        self.subtitle_list_stack.addWidget(self.subtitle_drop_area)
+        self.subtitle_list_stack.addWidget(self.subtitle_table)
+        self.subtitle_list_stack.setCurrentWidget(self.subtitle_drop_area)
+        splitter.addWidget(self.subtitle_list_stack_host)
+
+        self.subtitle_log_view = QTextEdit()
+        self.subtitle_log_view.setReadOnly(True)
+        splitter.addWidget(self.subtitle_log_view)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        self.subtitle_current_file_label = QLabel("현재 파일: 없음")
+        root_layout.addWidget(self.subtitle_current_file_label)
+
+        self.subtitle_stage_label = QLabel("현재 단계: 대기 중")
+        root_layout.addWidget(self.subtitle_stage_label)
+
+        self.subtitle_translation_progress_label = QLabel("번역 진행: 대기 중")
+        root_layout.addWidget(self.subtitle_translation_progress_label)
+
+        self.subtitle_translation_progress = QProgressBar()
+        self.subtitle_translation_progress.setRange(0, 100)
+        self.subtitle_translation_progress.setValue(0)
+        self.subtitle_translation_progress.setStyleSheet(GREEN_BAR_STYLE)
+        root_layout.addWidget(self.subtitle_translation_progress)
+
+        self.subtitle_queue_progress_label = QLabel("전체 대기열 진행률 0 / 0")
+        root_layout.addWidget(self.subtitle_queue_progress_label)
+
+        self.subtitle_queue_progress = QProgressBar()
+        self.subtitle_queue_progress.setRange(0, 100)
+        self.subtitle_queue_progress.setValue(0)
+        self.subtitle_queue_progress.setStyleSheet(GREEN_BAR_STYLE)
+        root_layout.addWidget(self.subtitle_queue_progress)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(content)
+
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.addWidget(scroll)
+        return page
+
     def _build_translation_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -735,6 +858,7 @@ class MainWindow(QMainWindow):
         return (
             (self._download_worker is not None and self._download_worker.isRunning())
             or (self._pipeline_worker is not None and self._pipeline_worker.isRunning())
+            or (self._subtitle_translation_worker is not None and self._subtitle_translation_worker.isRunning())
         )
 
     def _populate_runtime_choices(self) -> None:
@@ -902,9 +1026,12 @@ class MainWindow(QMainWindow):
     def update_controls(self) -> None:
         has_pending = any(item.status in {STATUS_PENDING, STATUS_FAILED} for item in self._items.values())
         has_rows = self.table.rowCount() > 0
+        has_subtitle_pending = any(item.status in {STATUS_PENDING, STATUS_FAILED} for item in self._subtitle_items.values())
+        has_subtitle_rows = self.subtitle_table.rowCount() > 0 if hasattr(self, "subtitle_table") else False
         download_running = self._download_worker is not None and self._download_worker.isRunning()
         processing_running = self._pipeline_worker is not None and self._pipeline_worker.isRunning()
-        enabled = not download_running and not processing_running
+        subtitle_processing_running = self._subtitle_translation_worker is not None and self._subtitle_translation_worker.isRunning()
+        enabled = not download_running and not processing_running and not subtitle_processing_running
 
         self.add_button.setEnabled(True)
         self.add_folder_button.setEnabled(True)
@@ -928,9 +1055,16 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(self._model_ready and has_pending and enabled)
         self.pause_button.setEnabled(processing_running and not getattr(self._pipeline_worker, "_pause_requested", False))
         self.resume_button.setEnabled(processing_running and getattr(self._pipeline_worker, "_pause_requested", False))
+        self.subtitle_add_button.setEnabled(True)
+        self.subtitle_add_folder_button.setEnabled(True)
+        self.subtitle_include_subdirs_checkbox.setEnabled(True)
+        self.subtitle_drop_area.setEnabled(True)
+        self.subtitle_remove_button.setEnabled(has_subtitle_rows)
+        self.subtitle_start_button.setEnabled(has_subtitle_pending and enabled)
         self.retry_download_button.setEnabled(not download_running and not self._model_ready)
         self.unload_model_button.setEnabled(not processing_running)
         self.tabs.setTabEnabled(1, True)
+        self.tabs.setTabEnabled(2, True)
         self.sync_translation_save_state()
 
     def open_file_dialog(self) -> None:
@@ -987,6 +1121,231 @@ class MainWindow(QMainWindow):
             self.refresh_queue_progress()
             self.update_file_area_mode()
         self.update_controls()
+
+    def open_subtitle_file_dialog(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "자막 파일 선택",
+            "",
+            "Subtitle Files (*.srt *.vtt *.txt)",
+        )
+        if files:
+            self.add_subtitle_files(files)
+
+    def open_subtitle_folder_dialog(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "자막 폴더 선택")
+        if folder:
+            self.add_subtitle_files([folder])
+
+    def add_subtitle_files(self, paths: list[str]) -> None:
+        items, errors = normalize_translation_files(paths, include_subdirs=self.subtitle_include_subdirs_checkbox.isChecked())
+        for error in errors:
+            self.log(error)
+            self.subtitle_log_view.append(error)
+
+        added_count = 0
+        added_paths: list[str] = []
+        for item in items:
+            key = str(item.source_path)
+            if key in self._subtitle_items:
+                self.subtitle_log_view.append(f"이미 목록에 존재함: {item.source_path}")
+                continue
+
+            row = self.subtitle_table.rowCount()
+            self.subtitle_table.insertRow(row)
+            name_item = QTableWidgetItem(item.source_path.name)
+            name_item.setToolTip(str(item.source_path))
+            path_item = QTableWidgetItem(str(item.source_path))
+            path_item.setToolTip(str(item.source_path))
+            status_item = QTableWidgetItem(item.status)
+            status_item.setToolTip(item.status)
+            self.subtitle_table.setItem(row, 0, name_item)
+            self.subtitle_table.setItem(row, 1, path_item)
+            self.subtitle_table.setItem(row, 2, status_item)
+            self.update_subtitle_row_appearance(row, item.status)
+            self._subtitle_items[key] = item
+            self._subtitle_rows_by_path[key] = row
+            added_count += 1
+            added_paths.append(key)
+
+        if added_count:
+            self.subtitle_log_view.append(f"자막 파일 {added_count}개 추가")
+            if self._subtitle_translation_processing and self._subtitle_translation_worker is not None and self._subtitle_translation_worker.isRunning():
+                self.subtitle_log_view.append("진행 중 추가된 파일은 현재 작업 뒤에 이어서 처리됩니다.")
+                self._subtitle_translation_worker.add_paths(added_paths)
+            self.refresh_subtitle_queue_progress()
+            self.update_subtitle_file_area_mode()
+        self.update_controls()
+
+    def update_subtitle_file_area_mode(self) -> None:
+        if getattr(self, "subtitle_list_stack", None) is None:
+            return
+        target = self.subtitle_drop_area if self.subtitle_table.rowCount() == 0 else self.subtitle_table
+        self.subtitle_list_stack.setCurrentWidget(target)
+
+    def update_subtitle_row_appearance(self, row: int, status: str) -> None:
+        color = None
+        if status in {STATUS_TRANSLATING, STATUS_SAVING}:
+            color = QColor("#e8f2ff")
+        elif status == STATUS_DONE:
+            color = QColor("#e7f7ea")
+        elif status == STATUS_FAILED:
+            color = QColor("#fdeaea")
+        elif status == STATUS_SKIPPED:
+            color = QColor("#f7f3e8")
+
+        for column in range(self.subtitle_table.columnCount()):
+            item = self.subtitle_table.item(row, column)
+            if item is None:
+                continue
+            item.setBackground(color if color is not None else QColor("#ffffff"))
+
+    def refresh_subtitle_queue_progress(self) -> None:
+        if self._subtitle_queue_total > 0:
+            total = self._subtitle_queue_total
+            finished = self._subtitle_queue_processed
+        else:
+            total = len(self._subtitle_items)
+            finished = sum(
+                1 for item in self._subtitle_items.values() if item.status in {STATUS_DONE, STATUS_FAILED, STATUS_SKIPPED}
+            )
+        percent = 100 if total == 0 else int(finished * 100 / total)
+        self.subtitle_queue_progress.setValue(percent)
+        self.subtitle_queue_progress_label.setText(f"전체 대기열 진행률 {finished} / {total}")
+
+    def _rebuild_subtitle_row_index(self) -> None:
+        self._subtitle_rows_by_path.clear()
+        for row in range(self.subtitle_table.rowCount()):
+            path_item = self.subtitle_table.item(row, 1)
+            if path_item is not None:
+                self._subtitle_rows_by_path[path_item.text()] = row
+
+    def _remove_subtitle_paths(self, paths: list[str]) -> int:
+        rows_to_remove: set[int] = set()
+        for source_path in paths:
+            row = self._subtitle_rows_by_path.get(source_path)
+            if row is not None:
+                rows_to_remove.add(row)
+
+        if not rows_to_remove:
+            return 0
+
+        for row in sorted(rows_to_remove, reverse=True):
+            path_item = self.subtitle_table.item(row, 1)
+            if path_item is not None:
+                self._subtitle_items.pop(path_item.text(), None)
+            self.subtitle_table.removeRow(row)
+
+        self._rebuild_subtitle_row_index()
+        self.refresh_subtitle_queue_progress()
+        self.update_subtitle_file_area_mode()
+        self.update_controls()
+        return len(rows_to_remove)
+
+    def remove_selected_subtitle_files(self) -> None:
+        selection_model = self.subtitle_table.selectionModel()
+        if selection_model is None:
+            return
+        selected_rows = selection_model.selectedRows()
+        if not selected_rows:
+            self.subtitle_log_view.append("제거할 자막 파일을 선택하지 않았습니다.")
+            return
+
+        removable_paths: list[str] = []
+        for index in selected_rows:
+            path_item = self.subtitle_table.item(index.row(), 1)
+            if path_item is not None:
+                removable_paths.append(path_item.text())
+        removed_count = 0
+        blocked_count = 0
+        if self._subtitle_translation_worker is not None and self._subtitle_translation_worker.isRunning():
+            removed_paths, blocked_paths = self._subtitle_translation_worker.remove_paths(removable_paths)
+            blocked_count = len(blocked_paths)
+            removed_count = self._remove_subtitle_paths(removed_paths)
+        else:
+            removed_count = self._remove_subtitle_paths(removable_paths)
+        if removed_count:
+            self.subtitle_log_view.append(f"선택한 자막 파일 {removed_count}개를 목록에서 제거했습니다.")
+        if blocked_count:
+            self.subtitle_log_view.append("현재 처리 중인 자막 파일은 즉시 제거할 수 없습니다.")
+
+    def update_subtitle_item_status(self, source_path: str, status: str, message: str = "") -> None:
+        item = self._subtitle_items.get(source_path)
+        row = self._subtitle_rows_by_path.get(source_path)
+        if item is None or row is None:
+            return
+
+        item.status = status
+        item.message = message
+        status_text = status if not message else f"{status} | {message}"
+        status_item = self.subtitle_table.item(row, 2)
+        if status_item is None:
+            status_item = QTableWidgetItem()
+            self.subtitle_table.setItem(row, 2, status_item)
+        status_item.setText(status_text)
+        status_item.setToolTip(status_text)
+        self.update_subtitle_row_appearance(row, status)
+
+        if status == STATUS_DONE:
+            removed_count = self._remove_subtitle_paths([source_path])
+            if removed_count:
+                self.subtitle_log_view.append(f"완료 파일 자동 제거: {source_path}")
+        elif status == STATUS_REMOVED:
+            self._remove_subtitle_paths([source_path])
+
+    def start_subtitle_translation(self) -> None:
+        api_keys = load_api_keys()
+        deepl_api_key = load_deepl_api_key()
+        if not api_keys:
+            self.tabs.setCurrentIndex(2)
+            QMessageBox.warning(self, APP_NAME, "번역 설정 탭에 Gemini API 키를 입력해 주세요.")
+            return
+        if self.translator_settings().use_deepl_fallback and not deepl_api_key:
+            self.tabs.setCurrentIndex(2)
+            QMessageBox.warning(self, APP_NAME, "DeepL 폴백을 사용하려면 DeepL Free API 키를 입력해 주세요.")
+            return
+
+        source_paths = [path for path, item in self._subtitle_items.items() if item.status in {STATUS_PENDING, STATUS_FAILED}]
+        if not source_paths:
+            self.subtitle_log_view.append("번역할 자막 파일이 없습니다.")
+            return
+
+        for source_path in source_paths:
+            self.update_subtitle_item_status(source_path, STATUS_PENDING)
+
+        self._subtitle_translation_processing = True
+        self._subtitle_success_count = 0
+        self._subtitle_failure_count = 0
+        self._subtitle_skipped_count = 0
+        self._subtitle_queue_total = len(source_paths)
+        self._subtitle_queue_processed = 0
+        self.subtitle_current_file_label.setText("현재 파일: 없음")
+        self.subtitle_stage_label.setText("현재 단계: 작업 준비")
+        self.subtitle_translation_progress.setValue(0)
+        self.subtitle_translation_progress_label.setText("번역 진행: 대기 중")
+
+        job = SubtitleTranslationJob(
+            source_paths=source_paths,
+            source_language=self.current_input_language(),
+            translator_settings=self.translator_settings(),
+            api_keys=api_keys,
+            deepl_api_key=deepl_api_key,
+        )
+        self._subtitle_translation_worker = SubtitleTranslationWorker(job, self)
+        self._subtitle_translation_worker.item_status_changed.connect(self.update_subtitle_item_status)
+        self._subtitle_translation_worker.log_message.connect(self.subtitle_log_view.append)
+        self._subtitle_translation_worker.queue_progress_changed.connect(self.on_subtitle_queue_progress_changed)
+        self._subtitle_translation_worker.file_started.connect(self.on_subtitle_file_started)
+        self._subtitle_translation_worker.stage_changed.connect(self.on_subtitle_stage_changed)
+        self._subtitle_translation_worker.translation_progress_changed.connect(self.on_subtitle_translation_progress_changed)
+        self._subtitle_translation_worker.summary_ready.connect(self.on_subtitle_summary_ready)
+        self._subtitle_translation_worker.failed.connect(self.on_subtitle_failed)
+        self._subtitle_translation_worker.start()
+        self.update_controls()
+        self.subtitle_log_view.append(
+            f"자막 번역 시작: {len(source_paths)}개 파일 | 입력 언어={self.input_language_combo.currentText()} | "
+            f"출력 언어={self.output_language_combo.currentText()}"
+        )
 
     def _rebuild_row_index(self) -> None:
         self._rows_by_path.clear()
@@ -1235,6 +1594,30 @@ class MainWindow(QMainWindow):
             f"번역 진행: 청크 {chunk_index}/{chunk_total} | 키 {key_display} | 모델 {model_name or '-'} | 에러 {error_count}"
         )
 
+    def on_subtitle_queue_progress_changed(self, processed: int, total: int) -> None:
+        self._subtitle_queue_processed = processed
+        self._subtitle_queue_total = total
+        self.refresh_subtitle_queue_progress()
+
+    def on_subtitle_file_started(self, index: int, total: int, source_path: str) -> None:
+        self.subtitle_current_file_label.setText(f"현재 파일: {index} / {total} | {source_path}")
+        self.subtitle_translation_progress.setValue(0)
+
+    def on_subtitle_stage_changed(self, stage_title: str, stage_detail: str) -> None:
+        self.subtitle_stage_label.setText(f"현재 단계: {stage_title} | {stage_detail}")
+
+    def on_subtitle_translation_progress_changed(
+        self, chunk_index: int, chunk_total: int, key_display: str, model_name: str, error_count: int
+    ) -> None:
+        percent = 0 if chunk_total <= 0 else int(chunk_index * 100 / chunk_total)
+        self.subtitle_translation_progress.setValue(max(0, min(100, percent)))
+        if chunk_total <= 0:
+            self.subtitle_translation_progress_label.setText("번역 진행: 대기 중")
+            return
+        self.subtitle_translation_progress_label.setText(
+            f"번역 진행: 청크 {chunk_index}/{chunk_total} | 키 {key_display} | 모델 {model_name or '-'} | 에러 {error_count}"
+        )
+
     def on_pipeline_summary_ready(self, success_count: int, failure_count: int, skipped_count: int) -> None:
         self._processing = False
         self._session_success_count += success_count
@@ -1267,5 +1650,33 @@ class MainWindow(QMainWindow):
         self._queue_processed = 0
         self.log(f"작업 실패: {message}")
         self.refresh_model_status()
+        self.update_controls()
+        QMessageBox.warning(self, APP_NAME, message)
+
+    def on_subtitle_summary_ready(self, success_count: int, failure_count: int, skipped_count: int) -> None:
+        self._subtitle_translation_processing = False
+        self._subtitle_success_count += success_count
+        self._subtitle_failure_count += failure_count
+        self._subtitle_skipped_count += skipped_count
+        self.subtitle_current_file_label.setText("현재 파일: 작업 완료")
+        self.subtitle_stage_label.setText("현재 단계: 완료")
+        self.subtitle_translation_progress.setValue(100)
+        self.refresh_subtitle_queue_progress()
+        self._subtitle_queue_total = 0
+        self._subtitle_queue_processed = 0
+        self.update_controls()
+
+        summary = (
+            f"자막 번역 완료\n성공: {self._subtitle_success_count}\n실패: {self._subtitle_failure_count}\n스킵: {self._subtitle_skipped_count}"
+        )
+        self.subtitle_log_view.append(summary.replace("\n", " | "))
+        QMessageBox.information(self, APP_NAME, summary)
+
+    def on_subtitle_failed(self, message: str) -> None:
+        self._subtitle_translation_processing = False
+        self.subtitle_stage_label.setText(f"현재 단계: 실패 | {message}")
+        self._subtitle_queue_total = 0
+        self._subtitle_queue_processed = 0
+        self.subtitle_log_view.append(f"작업 실패: {message}")
         self.update_controls()
         QMessageBox.warning(self, APP_NAME, message)

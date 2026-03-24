@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from .config import SUPPORTED_EXTENSIONS
+from .config import SUPPORTED_EXTENSIONS, TRANSLATOR_SUPPORTED_EXTENSIONS
 
 
 STATUS_PENDING = "대기중"
@@ -57,6 +57,44 @@ def normalize_input_files(
 
         if resolved.suffix.lower() not in SUPPORTED_EXTENSIONS:
             errors.append(f"지원하지 않는 파일 형식: {resolved}")
+            continue
+        if not resolved.exists() or not resolved.is_file():
+            errors.append(f"파일을 찾을 수 없음: {resolved}")
+            continue
+
+        _append_item(resolved, items, seen)
+
+    return items, errors
+
+
+def normalize_translation_files(
+    paths: Iterable[str | Path],
+    include_subdirs: bool = True,
+) -> tuple[list[QueueItem], list[str]]:
+    items: list[QueueItem] = []
+    errors: list[str] = []
+    seen: set[Path] = set()
+
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        try:
+            resolved = path.resolve(strict=False)
+        except OSError as exc:
+            errors.append(f"경로 확인 실패: {path} ({exc})")
+            continue
+
+        if resolved.is_dir():
+            iterator = resolved.rglob("*") if include_subdirs else resolved.glob("*")
+            for candidate in iterator:
+                if not candidate.is_file():
+                    continue
+                if candidate.suffix.lower() not in TRANSLATOR_SUPPORTED_EXTENSIONS:
+                    continue
+                _append_item(candidate, items, seen)
+            continue
+
+        if resolved.suffix.lower() not in TRANSLATOR_SUPPORTED_EXTENSIONS:
+            errors.append(f"지원하지 않는 자막 파일 형식: {resolved}")
             continue
         if not resolved.exists() or not resolved.is_file():
             errors.append(f"파일을 찾을 수 없음: {resolved}")
