@@ -480,6 +480,100 @@ class PipelineWorker(QThread):
             finally:
                 self._save_queue.task_done()
 
+    def _next_source(self) -> tuple[str | None, int, int]:
+        with self._condition:
+            while True:
+                while self._pause_requested:
+                    self.processing_state_changed.emit(STATUS_PAUSED, "일시 중지됨")
+                    self._condition.wait()
+
+                if self._stop_requested:
+                    return None, self._processed, self._processed
+
+                if self._pending_paths:
+                    source_str = self._pending_paths.popleft()
+                    self._current_path = source_str
+                    total = self._processed + len(self._pending_paths) + 1
+                    index = self._processed + 1
+                    self.processing_state_changed.emit(STATUS_TRANSCRIBING, "처리 중")
+                    return source_str, index, total
+
+                return None, self._processed, self._processed
+
+    def _complete_current(self) -> None:
+        with self._condition:
+            if self._current_path is not None:
+                self._queued_paths.discard(self._current_path)
+                self._current_path = None
+                self._processed += 1
+            total = self._processed + len(self._pending_paths)
+        self.queue_progress_changed.emit(self._processed, total)
+
+    def _requeue_current(self, source_str: str) -> None:
+        with self._condition:
+            self._pending_paths.appendleft(source_str)
+
+    def _pause_checkpoint(self, detail: str) -> None:
+        with self._condition:
+            while self._pause_requested:
+                self.processing_state_changed.emit(STATUS_PAUSED, detail)
+                self._condition.wait()
+
+    def _make_stage_progress_callback(self):
+        def callback(percent: int, current: float, total: float) -> None:
+            self._pause_checkpoint("현재 파일 일시 중지됨")
+            self.stage_progress_changed.emit(percent, current, total)
+
+        return callback
+
+    def _make_translation_progress_callback(self):
+        def callback(chunk_index: int, chunk_total: int, key_display: str, model_name: str, error_count: int) -> None:
+            self._pause_checkpoint("현재 파일 일시 중지됨")
+            self.translation_progress_changed.emit(chunk_index, chunk_total, key_display, model_name, error_count)
+
+        return callback
+
+    def _report_runtime_progress(
+        self,
+        downloaded_bytes: int,
+        total_bytes: int,
+        filename: str,
+        file_downloaded: int,
+        file_total: int,
+    ) -> None:
+        self._emit_prep_progress("CUDA runtime", downloaded_bytes, total_bytes, filename, file_downloaded, file_total)
+
+    def _report_dictionary_progress(
+        self,
+        downloaded_bytes: int,
+        total_bytes: int,
+        filename: str,
+        file_downloaded: int,
+        file_total: int,
+    ) -> None:
+        self._emit_prep_progress("Japanese dictionary pack", downloaded_bytes, total_bytes, filename, file_downloaded, file_total)
+
+    def _emit_prep_progress(
+        self,
+        label: str,
+        downloaded_bytes: int,
+        total_bytes: int,
+        filename: str,
+        file_downloaded: int,
+        file_total: int,
+    ) -> None:
+        if filename:
+            if total_bytes > 0:
+                percent = min(100, int(downloaded_bytes * 100 / total_bytes))
+            elif file_total > 0:
+                percent = min(100, int(file_downloaded * 100 / file_total))
+            else:
+                percent = 100
+            self.stage_progress_changed.emit(percent, 0.0, 0.0)
+            self.log_message.emit(
+                f"{label} download {percent}% | {filename} ({format_bytes(file_downloaded)}/{format_bytes(file_total)})"
+            )
+
 
 def build_translated_subtitle_output_path(source_path: Path, language_code: str) -> Path:
     normalized = language_code.strip().lower() or "translated"
@@ -665,97 +759,4 @@ class SubtitleTranslationWorker(QThread):
         except Exception as exc:
             self.failed.emit(str(exc) or exc.__class__.__name__)
 
-    def _next_source(self) -> tuple[str | None, int, int]:
-        with self._condition:
-            while True:
-                while self._pause_requested:
-                    self.processing_state_changed.emit(STATUS_PAUSED, "일시 중지됨")
-                    self._condition.wait()
-
-                if self._stop_requested:
-                    return None, self._processed, self._processed
-
-                if self._pending_paths:
-                    source_str = self._pending_paths.popleft()
-                    self._current_path = source_str
-                    total = self._processed + len(self._pending_paths) + 1
-                    index = self._processed + 1
-                    self.processing_state_changed.emit(STATUS_TRANSCRIBING, "처리 중")
-                    return source_str, index, total
-
-                return None, self._processed, self._processed
-
-    def _complete_current(self) -> None:
-        with self._condition:
-            if self._current_path is not None:
-                self._queued_paths.discard(self._current_path)
-                self._current_path = None
-                self._processed += 1
-            total = self._processed + len(self._pending_paths)
-        self.queue_progress_changed.emit(self._processed, total)
-
-    def _requeue_current(self, source_str: str) -> None:
-        with self._condition:
-            self._pending_paths.appendleft(source_str)
-
-    def _pause_checkpoint(self, detail: str) -> None:
-        with self._condition:
-            while self._pause_requested:
-                self.processing_state_changed.emit(STATUS_PAUSED, detail)
-                self._condition.wait()
-
-    def _make_stage_progress_callback(self):
-        def callback(percent: int, current: float, total: float) -> None:
-            self._pause_checkpoint("현재 파일 일시 중지됨")
-            self.stage_progress_changed.emit(percent, current, total)
-
-        return callback
-
-    def _make_translation_progress_callback(self):
-        def callback(chunk_index: int, chunk_total: int, key_display: str, model_name: str, error_count: int) -> None:
-            self._pause_checkpoint("현재 파일 일시 중지됨")
-            self.translation_progress_changed.emit(chunk_index, chunk_total, key_display, model_name, error_count)
-
-        return callback
-
-    def _report_runtime_progress(
-        self,
-        downloaded_bytes: int,
-        total_bytes: int,
-        filename: str,
-        file_downloaded: int,
-        file_total: int,
-    ) -> None:
-        self._emit_prep_progress("CUDA runtime", downloaded_bytes, total_bytes, filename, file_downloaded, file_total)
-
-    def _report_dictionary_progress(
-        self,
-        downloaded_bytes: int,
-        total_bytes: int,
-        filename: str,
-        file_downloaded: int,
-        file_total: int,
-    ) -> None:
-        self._emit_prep_progress("Japanese dictionary pack", downloaded_bytes, total_bytes, filename, file_downloaded, file_total)
-
-    def _emit_prep_progress(
-        self,
-        label: str,
-        downloaded_bytes: int,
-        total_bytes: int,
-        filename: str,
-        file_downloaded: int,
-        file_total: int,
-    ) -> None:
-        if filename:
-            if total_bytes > 0:
-                percent = min(100, int(downloaded_bytes * 100 / total_bytes))
-            elif file_total > 0:
-                percent = min(100, int(file_downloaded * 100 / file_total))
-            else:
-                percent = 100
-            self.stage_progress_changed.emit(percent, 0.0, 0.0)
-            self.log_message.emit(
-                f"{label} download {percent}% | {filename} ({format_bytes(file_downloaded)}/{format_bytes(file_total)})"
-            )
 
