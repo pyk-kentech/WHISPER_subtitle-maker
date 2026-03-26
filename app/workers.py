@@ -442,6 +442,44 @@ class PipelineWorker(QThread):
                 unload_loaded_models(self.job.model_key)
             self.failed.emit(str(exc) or exc.__class__.__name__)
 
+    def _start_save_worker(self) -> None:
+        if self._save_thread is not None and self._save_thread.is_alive():
+            return
+        self._save_thread = threading.Thread(target=self._save_worker_main, name="SubtitleSaveWorker", daemon=True)
+        self._save_thread.start()
+
+    def _enqueue_save(self, task: SaveTask) -> None:
+        self._save_queue.put(task)
+
+    def _wait_for_save_completion(self) -> None:
+        if self._save_thread is None:
+            return
+        self._save_queue.join()
+        self._save_queue.put(None)
+        self._save_queue.join()
+        self._save_thread.join()
+        self._save_thread = None
+
+    def _save_worker_main(self) -> None:
+        while True:
+            task = self._save_queue.get()
+            try:
+                if task is None:
+                    return
+                write_srt_text(task.output_path, task.content)
+                with self._counter_lock:
+                    self._success_count += 1
+                self.item_status_changed.emit(task.source_path, STATUS_DONE, str(task.output_path))
+                self.log_message.emit(f"{task.source_path} | 완료 -> {task.output_path}")
+            except Exception as exc:
+                with self._counter_lock:
+                    self._failure_count += 1
+                message = str(exc) or exc.__class__.__name__
+                self.item_status_changed.emit(task.source_path, STATUS_FAILED, message)
+                self.log_message.emit(f"{task.source_path} | 저장 실패 -> {message}")
+            finally:
+                self._save_queue.task_done()
+
 
 def build_translated_subtitle_output_path(source_path: Path, language_code: str) -> Path:
     normalized = language_code.strip().lower() or "translated"
@@ -721,40 +759,3 @@ class SubtitleTranslationWorker(QThread):
                 f"{label} download {percent}% | {filename} ({format_bytes(file_downloaded)}/{format_bytes(file_total)})"
             )
 
-    def _start_save_worker(self) -> None:
-        if self._save_thread is not None and self._save_thread.is_alive():
-            return
-        self._save_thread = threading.Thread(target=self._save_worker_main, name="SubtitleSaveWorker", daemon=True)
-        self._save_thread.start()
-
-    def _enqueue_save(self, task: SaveTask) -> None:
-        self._save_queue.put(task)
-
-    def _wait_for_save_completion(self) -> None:
-        if self._save_thread is None:
-            return
-        self._save_queue.join()
-        self._save_queue.put(None)
-        self._save_queue.join()
-        self._save_thread.join()
-        self._save_thread = None
-
-    def _save_worker_main(self) -> None:
-        while True:
-            task = self._save_queue.get()
-            try:
-                if task is None:
-                    return
-                write_srt_text(task.output_path, task.content)
-                with self._counter_lock:
-                    self._success_count += 1
-                self.item_status_changed.emit(task.source_path, STATUS_DONE, str(task.output_path))
-                self.log_message.emit(f"{task.source_path} | 완료 -> {task.output_path}")
-            except Exception as exc:
-                with self._counter_lock:
-                    self._failure_count += 1
-                message = str(exc) or exc.__class__.__name__
-                self.item_status_changed.emit(task.source_path, STATUS_FAILED, message)
-                self.log_message.emit(f"{task.source_path} | 저장 실패 -> {message}")
-            finally:
-                self._save_queue.task_done()
