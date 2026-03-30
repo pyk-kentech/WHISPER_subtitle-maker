@@ -2,11 +2,13 @@
 
 from datetime import datetime
 import logging
+import subprocess
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -38,6 +40,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from .config import (
@@ -166,7 +169,7 @@ class DropArea(QFrame):
         layout = QVBoxLayout(self)
         label = QLabel(label_text)
         label.setAlignment(Qt.AlignCenter)
-        label.setMinimumHeight(220)
+        label.setMinimumHeight(150)
         label.setWordWrap(True)
         label.setStyleSheet("font-size: 18px; font-weight: 600; color: #31455a;")
         layout.addWidget(label)
@@ -262,8 +265,8 @@ class MainWindow(QMainWindow):
     def __init__(self, auto_download_on_startup: bool = True) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1200, 860)
-        self.setMinimumSize(780, 560)
+        self.resize(980, 520)
+        self.setMinimumSize(720, 420)
         self._app_icon = self._load_app_icon()
         if self._app_icon is not None:
             self.setWindowIcon(self._app_icon)
@@ -293,6 +296,7 @@ class MainWindow(QMainWindow):
         self._current_file_prefix = "현재 파일: 없음"
         self._stage_title = "대기 중"
         self._stage_detail = ""
+        self._shutdown_scheduled = False
         self._subtitle_items: dict[str, QueueItem] = {}
         self._subtitle_rows_by_path: dict[str, int] = {}
 
@@ -340,81 +344,60 @@ class MainWindow(QMainWindow):
     def _build_main_tab(self) -> QWidget:
         content = QWidget()
         root_layout = QVBoxLayout(content)
-        root_layout.setSpacing(10)
-
-        runtime_row = QHBoxLayout()
-        runtime_row.addWidget(QLabel("실행 장치"))
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(8)
 
         self.runtime_combo = QComboBox()
         self._populate_runtime_choices()
         self.runtime_combo.currentIndexChanged.connect(self.on_runtime_changed)
-        runtime_row.addWidget(self.runtime_combo)
 
-        runtime_row.addWidget(QLabel("Whisper 모델"))
         self.model_combo = QComboBox()
         for model_key, preset in MODEL_PRESETS.items():
             self.model_combo.addItem(str(preset["label"]), model_key)
         self.model_combo.setCurrentIndex(max(0, self.model_combo.findData(DEFAULT_MODEL_KEY)))
         self.model_combo.currentIndexChanged.connect(self.on_model_changed)
-        runtime_row.addWidget(self.model_combo)
 
-        runtime_row.addWidget(QLabel("입력 언어"))
         self.input_language_combo = QComboBox()
         for code, label in INPUT_LANGUAGE_OPTIONS:
             self.input_language_combo.addItem(label, code)
         self.input_language_combo.setCurrentIndex(max(0, self.input_language_combo.findData(DEFAULT_INPUT_LANGUAGE)))
-        runtime_row.addWidget(self.input_language_combo)
 
-        runtime_row.addWidget(QLabel("출력 언어"))
         self.output_language_combo = QComboBox()
         for code, label in OUTPUT_LANGUAGE_OPTIONS:
             self.output_language_combo.addItem(label, code)
         self.output_language_combo.setCurrentIndex(max(0, self.output_language_combo.findData(self._translator_settings.target_language)))
         self.output_language_combo.currentIndexChanged.connect(self.mark_translation_inputs_dirty)
-        runtime_row.addWidget(self.output_language_combo)
 
         self.postprocess_checkbox = QCheckBox("기본 후처리")
         self.postprocess_checkbox.setChecked(True)
         self.postprocess_checkbox.toggled.connect(self.on_postprocess_changed)
-        runtime_row.addWidget(self.postprocess_checkbox)
 
         self.enhanced_postprocess_checkbox = QCheckBox("강화 후처리")
         self.enhanced_postprocess_checkbox.setChecked(False)
         self.enhanced_postprocess_checkbox.toggled.connect(self.on_enhanced_postprocess_changed)
-        runtime_row.addWidget(self.enhanced_postprocess_checkbox)
-        runtime_row.addStretch(1)
-        root_layout.addLayout(runtime_row)
 
-        performance_row = QHBoxLayout()
-        performance_row.addWidget(QLabel("compute_type"))
         self.compute_type_combo = QComboBox()
         self._populate_compute_type_choices()
-        performance_row.addWidget(self.compute_type_combo)
 
-        performance_row.addWidget(QLabel("CPU threads"))
         self.cpu_threads_spin = QSpinBox()
         self.cpu_threads_spin.setRange(1, get_max_worker_count())
         self.cpu_threads_spin.setValue(get_default_cpu_threads())
-        performance_row.addWidget(self.cpu_threads_spin)
 
-        performance_row.addWidget(QLabel("num_workers"))
         self.num_workers_spin = QSpinBox()
         self.num_workers_spin.setRange(1, get_max_worker_count())
         self.num_workers_spin.setValue(1)
-        performance_row.addWidget(self.num_workers_spin)
 
-        performance_row.addWidget(QLabel("RAM 사용량"))
         self.memory_profile_combo = QComboBox()
         for value, label in get_memory_profile_choices():
             self.memory_profile_combo.addItem(label, value)
         self.memory_profile_combo.setCurrentIndex(max(0, self.memory_profile_combo.findData("unlimited")))
-        performance_row.addWidget(self.memory_profile_combo)
 
         self.auto_unload_checkbox = QCheckBox("작업 완료 후 모델 자동 해제")
         self.auto_unload_checkbox.setChecked(True)
-        performance_row.addWidget(self.auto_unload_checkbox)
-        performance_row.addStretch(1)
-        root_layout.addLayout(performance_row)
+
+        self.shutdown_after_complete_checkbox = QCheckBox("작업 완료 후 2분 뒤 시스템 종료")
+        self.shutdown_after_complete_checkbox.setChecked(False)
+        self.shutdown_after_complete_checkbox.toggled.connect(self.on_shutdown_after_complete_changed)
 
         self.model_status_label = QLabel("모델 상태 확인 중...")
         root_layout.addWidget(self.model_status_label)
@@ -428,30 +411,41 @@ class MainWindow(QMainWindow):
         self.model_progress.setStyleSheet(GREEN_BAR_STYLE)
         root_layout.addWidget(self.model_progress)
 
-        vad_row = QHBoxLayout()
-        vad_row.addWidget(QLabel("VAD 필터"))
         self.vad_mode_combo = QComboBox()
         self.vad_mode_combo.addItem("ON", True)
         self.vad_mode_combo.addItem("OFF (Whisper only)", False)
         self.vad_mode_combo.setCurrentIndex(max(0, self.vad_mode_combo.findData(DEFAULT_VAD_ENABLED)))
         self.vad_mode_combo.currentIndexChanged.connect(self.on_vad_changed)
-        vad_row.addWidget(self.vad_mode_combo)
 
-        vad_row.addWidget(QLabel("최소 침묵(ms)"))
         self.vad_min_silence_spin = QSpinBox()
         self.vad_min_silence_spin.setRange(0, 5000)
         self.vad_min_silence_spin.setValue(DEFAULT_VAD_MIN_SILENCE_MS)
-        vad_row.addWidget(self.vad_min_silence_spin)
 
-        vad_row.addWidget(QLabel("패딩(ms)"))
         self.vad_speech_pad_spin = QSpinBox()
         self.vad_speech_pad_spin.setRange(0, 5000)
         self.vad_speech_pad_spin.setValue(DEFAULT_VAD_SPEECH_PAD_MS)
-        vad_row.addWidget(self.vad_speech_pad_spin)
-        vad_row.addStretch(1)
-        root_layout.addLayout(vad_row)
+
+        settings_bar = QHBoxLayout()
+        settings_bar.setSpacing(6)
+        settings_bar.addWidget(QLabel("작업 설정"))
+        settings_bar.addWidget(self._build_settings_menu_button("STT 설정", self._create_stt_settings_menu()))
+        settings_bar.addWidget(self._build_settings_menu_button("성능 설정", self._create_performance_settings_menu()))
+        settings_bar.addWidget(self._build_settings_menu_button("처리 설정", self._create_process_settings_menu()))
+        settings_bar.addStretch(1)
+        root_layout.addLayout(settings_bar)
+
+        self.main_settings_summary_label = QLabel("")
+        self.main_settings_summary_label.setWordWrap(True)
+        self.main_settings_summary_label.setStyleSheet(
+            "padding: 8px 10px; border: 1px solid #d7e0ea; border-radius: 8px; background: #f6f9fc; color: #32465a;"
+        )
+        root_layout.addWidget(self.main_settings_summary_label)
+
+        self._wire_main_settings_summary_signals()
+        self.refresh_main_settings_summary()
 
         button_row = QHBoxLayout()
+        button_row.setSpacing(6)
         self.add_button = QPushButton("파일 추가")
         self.add_button.clicked.connect(self.open_file_dialog)
         button_row.addWidget(self.add_button)
@@ -522,6 +516,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.log_view)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+        splitter.setSizes([420, 180])
 
         self.current_file_label = QLabel(self._current_file_prefix)
         root_layout.addWidget(self.current_file_label)
@@ -552,18 +547,104 @@ class MainWindow(QMainWindow):
         self.queue_progress.setValue(0)
         self.queue_progress.setStyleSheet(GREEN_BAR_STYLE)
         root_layout.addWidget(self.queue_progress)
+        return content
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setWidget(content)
+    def _build_settings_menu_button(self, title: str, menu: QMenu) -> QToolButton:
+        button = QToolButton()
+        button.setText(title)
+        button.setPopupMode(QToolButton.InstantPopup)
+        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        button.setMenu(menu)
+        button.setStyleSheet(
+            "QToolButton { padding: 6px 10px; border: 1px solid #c9d4df; border-radius: 8px; background: #ffffff; }"
+            "QToolButton::menu-indicator { subcontrol-position: right center; }"
+        )
+        return button
 
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(0, 0, 0, 0)
-        page_layout.addWidget(scroll)
-        return page
+    def _create_menu_field(self, label_text: str, widget: QWidget) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(8)
+        label = QLabel(label_text)
+        label.setMinimumWidth(112)
+        layout.addWidget(label)
+        widget.setMinimumWidth(170)
+        layout.addWidget(widget, 1)
+        return container
+
+    def _add_widget_action(self, menu: QMenu, label_text: str, widget: QWidget) -> None:
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(self._create_menu_field(label_text, widget))
+        menu.addAction(action)
+
+    def _create_stt_settings_menu(self) -> QMenu:
+        menu = QMenu(self)
+        runtime_menu = menu.addMenu("실행 / 모델")
+        self._add_widget_action(runtime_menu, "실행 장치", self.runtime_combo)
+        self._add_widget_action(runtime_menu, "Whisper 모델", self.model_combo)
+
+        language_menu = menu.addMenu("언어")
+        self._add_widget_action(language_menu, "입력 언어", self.input_language_combo)
+        self._add_widget_action(language_menu, "출력 언어", self.output_language_combo)
+        return menu
+
+    def _create_performance_settings_menu(self) -> QMenu:
+        menu = QMenu(self)
+        self._add_widget_action(menu, "compute_type", self.compute_type_combo)
+        self._add_widget_action(menu, "CPU threads", self.cpu_threads_spin)
+        self._add_widget_action(menu, "num_workers", self.num_workers_spin)
+        self._add_widget_action(menu, "RAM 사용량", self.memory_profile_combo)
+        return menu
+
+    def _create_process_settings_menu(self) -> QMenu:
+        menu = QMenu(self)
+        postprocess_menu = menu.addMenu("후처리")
+        self._add_widget_action(postprocess_menu, "기본 후처리", self.postprocess_checkbox)
+        self._add_widget_action(postprocess_menu, "강화 후처리", self.enhanced_postprocess_checkbox)
+
+        vad_menu = menu.addMenu("VAD")
+        self._add_widget_action(vad_menu, "VAD 필터", self.vad_mode_combo)
+        self._add_widget_action(vad_menu, "최소 침묵(ms)", self.vad_min_silence_spin)
+        self._add_widget_action(vad_menu, "패딩(ms)", self.vad_speech_pad_spin)
+
+        finish_menu = menu.addMenu("완료 후 동작")
+        self._add_widget_action(finish_menu, "모델 자동 해제", self.auto_unload_checkbox)
+        self._add_widget_action(finish_menu, "2분 후 종료", self.shutdown_after_complete_checkbox)
+        return menu
+
+    def _wire_main_settings_summary_signals(self) -> None:
+        self.runtime_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.model_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.input_language_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.output_language_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.compute_type_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.cpu_threads_spin.valueChanged.connect(self.refresh_main_settings_summary)
+        self.num_workers_spin.valueChanged.connect(self.refresh_main_settings_summary)
+        self.memory_profile_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.auto_unload_checkbox.toggled.connect(self.refresh_main_settings_summary)
+        self.shutdown_after_complete_checkbox.toggled.connect(self.refresh_main_settings_summary)
+        self.vad_mode_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.vad_min_silence_spin.valueChanged.connect(self.refresh_main_settings_summary)
+        self.vad_speech_pad_spin.valueChanged.connect(self.refresh_main_settings_summary)
+        self.postprocess_checkbox.toggled.connect(self.refresh_main_settings_summary)
+        self.enhanced_postprocess_checkbox.toggled.connect(self.refresh_main_settings_summary)
+
+    def refresh_main_settings_summary(self, *_args) -> None:
+        if not hasattr(self, "main_settings_summary_label"):
+            return
+        summary = (
+            f"실행 {self.runtime_combo.currentText()} | 모델 {self.model_combo.currentText()} | "
+            f"{self.input_language_combo.currentText()} -> {self.output_language_combo.currentText()} | "
+            f"compute {self.compute_type_combo.currentText()} | CPU {self.cpu_threads_spin.value()} | "
+            f"workers {self.num_workers_spin.value()} | RAM {self.memory_profile_combo.currentText()} | "
+            f"VAD {'ON' if self.is_vad_enabled() else 'OFF'} | "
+            f"기본 후처리 {'ON' if self.postprocess_checkbox.isChecked() else 'OFF'} | "
+            f"강화 후처리 {'ON' if self.enhanced_postprocess_checkbox.isChecked() else 'OFF'} | "
+            f"완료 후 모델 해제 {'ON' if self.auto_unload_checkbox.isChecked() else 'OFF'} | "
+            f"2분 후 종료 {'ON' if self.shutdown_after_complete_checkbox.isChecked() else 'OFF'}"
+        )
+        self.main_settings_summary_label.setText(summary)
 
     def _create_tray_icon(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -619,9 +700,17 @@ class MainWindow(QMainWindow):
 
     def quit_from_tray(self) -> None:
         self._allow_close = True
+        self._stop_workers_for_exit()
+        if self._shutdown_scheduled:
+            self._cancel_scheduled_shutdown()
         if self.tray_icon is not None:
             self.tray_icon.hide()
+            self.tray_icon.deleteLater()
+            self.tray_icon = None
         self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
@@ -843,6 +932,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._allow_close:
+            if self.tray_icon is not None:
+                self.tray_icon.hide()
             super().closeEvent(event)
             return
 
@@ -863,6 +954,16 @@ class MainWindow(QMainWindow):
             or (self._pipeline_worker is not None and self._pipeline_worker.isRunning())
             or (self._subtitle_translation_worker is not None and self._subtitle_translation_worker.isRunning())
         )
+
+    def _stop_workers_for_exit(self) -> None:
+        for worker in (self._download_worker, self._pipeline_worker, self._subtitle_translation_worker):
+            if worker is None or not worker.isRunning():
+                continue
+            worker.requestInterruption()
+            worker.quit()
+            if not worker.wait(1200):
+                worker.terminate()
+                worker.wait(1200)
 
     def _populate_runtime_choices(self) -> None:
         saved = get_default_runtime_choice()
@@ -890,6 +991,7 @@ class MainWindow(QMainWindow):
     def on_runtime_changed(self) -> None:
         self._populate_compute_type_choices()
         self.refresh_model_status()
+        self.refresh_main_settings_summary()
         self.log(f"실행 장치 선택: {self.runtime_combo.currentText()}")
 
     def on_enhanced_postprocess_changed(self, checked: bool) -> None:
@@ -904,6 +1006,10 @@ class MainWindow(QMainWindow):
         vad_enabled = self.is_vad_enabled()
         self.vad_min_silence_spin.setEnabled(vad_enabled)
         self.vad_speech_pad_spin.setEnabled(vad_enabled)
+
+    def on_shutdown_after_complete_changed(self, checked: bool) -> None:
+        if not checked and self._shutdown_scheduled:
+            self._cancel_scheduled_shutdown()
 
     def current_runtime_device(self) -> str:
         return str(self.runtime_combo.currentData() or "cpu")
@@ -936,6 +1042,7 @@ class MainWindow(QMainWindow):
 
     def on_model_changed(self) -> None:
         self.refresh_model_status()
+        self.refresh_main_settings_summary()
 
     def collect_translation_inputs(self) -> TranslatorSettings:
         return TranslatorSettings(
@@ -1054,6 +1161,7 @@ class MainWindow(QMainWindow):
         self.num_workers_spin.setEnabled(enabled)
         self.memory_profile_combo.setEnabled(enabled)
         self.auto_unload_checkbox.setEnabled(True)
+        self.shutdown_after_complete_checkbox.setEnabled(True)
         self.vad_mode_combo.setEnabled(enabled)
         self.vad_min_silence_spin.setEnabled(enabled and self.is_vad_enabled())
         self.vad_speech_pad_spin.setEnabled(enabled and self.is_vad_enabled())
@@ -1647,6 +1755,7 @@ class MainWindow(QMainWindow):
             f"작업 완료\n성공: {self._session_success_count}\n실패: {self._session_failure_count}\n스킵: {self._session_skipped_count}"
         )
         self.log(summary.replace("\n", " | "))
+        self._schedule_shutdown_after_completion("메인 작업")
         QMessageBox.information(self, APP_NAME, summary)
 
     def on_pipeline_failed(self, message: str) -> None:
@@ -1678,6 +1787,7 @@ class MainWindow(QMainWindow):
             f"자막 번역 완료\n성공: {self._subtitle_success_count}\n실패: {self._subtitle_failure_count}\n스킵: {self._subtitle_skipped_count}"
         )
         self.subtitle_log_view.append(summary.replace("\n", " | "))
+        self._schedule_shutdown_after_completion("자막 번역 작업")
         QMessageBox.information(self, APP_NAME, summary)
 
     def on_subtitle_failed(self, message: str) -> None:
@@ -1688,3 +1798,36 @@ class MainWindow(QMainWindow):
         self.subtitle_log_view.append(f"작업 실패: {message}")
         self.update_controls()
         QMessageBox.warning(self, APP_NAME, message)
+
+    def _schedule_shutdown_after_completion(self, job_label: str) -> None:
+        if not self.shutdown_after_complete_checkbox.isChecked() or self._shutdown_scheduled:
+            return
+        try:
+            subprocess.run(["shutdown", "/s", "/t", "120"], check=True, capture_output=True, text=True)
+        except Exception as exc:
+            message = f"{job_label} 완료 후 자동 종료 예약에 실패했습니다: {str(exc) or exc.__class__.__name__}"
+            self.log(message)
+            if self.tray_icon is not None:
+                self.tray_icon.showMessage(APP_NAME, message, QSystemTrayIcon.Warning, 4000)
+            return
+
+        self._shutdown_scheduled = True
+        message = f"{job_label} 완료: 2분 후 시스템 종료가 예약되었습니다."
+        self.log(message)
+        self.subtitle_log_view.append(message)
+        if self.tray_icon is not None:
+            self.tray_icon.showMessage(APP_NAME, message, QSystemTrayIcon.Information, 4000)
+
+    def _cancel_scheduled_shutdown(self) -> None:
+        try:
+            subprocess.run(["shutdown", "/a"], check=True, capture_output=True, text=True)
+        except Exception as exc:
+            self.log(f"예약된 시스템 종료 취소에 실패했습니다: {str(exc) or exc.__class__.__name__}")
+            return
+
+        self._shutdown_scheduled = False
+        message = "예약된 시스템 종료를 취소했습니다."
+        self.log(message)
+        self.subtitle_log_view.append(message)
+        if self.tray_icon is not None:
+            self.tray_icon.showMessage(APP_NAME, message, QSystemTrayIcon.Information, 3000)
