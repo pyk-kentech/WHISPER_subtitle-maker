@@ -429,10 +429,13 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.model_progress)
 
         vad_row = QHBoxLayout()
-        self.vad_checkbox = QCheckBox("VAD 사용")
-        self.vad_checkbox.setChecked(DEFAULT_VAD_ENABLED)
-        self.vad_checkbox.toggled.connect(self.on_vad_changed)
-        vad_row.addWidget(self.vad_checkbox)
+        vad_row.addWidget(QLabel("VAD 필터"))
+        self.vad_mode_combo = QComboBox()
+        self.vad_mode_combo.addItem("ON", True)
+        self.vad_mode_combo.addItem("OFF (Whisper only)", False)
+        self.vad_mode_combo.setCurrentIndex(max(0, self.vad_mode_combo.findData(DEFAULT_VAD_ENABLED)))
+        self.vad_mode_combo.currentIndexChanged.connect(self.on_vad_changed)
+        vad_row.addWidget(self.vad_mode_combo)
 
         vad_row.addWidget(QLabel("최소 침묵(ms)"))
         self.vad_min_silence_spin = QSpinBox()
@@ -897,9 +900,10 @@ class MainWindow(QMainWindow):
         if not checked and self.enhanced_postprocess_checkbox.isChecked():
             self.enhanced_postprocess_checkbox.setChecked(False)
 
-    def on_vad_changed(self, checked: bool) -> None:
-        self.vad_min_silence_spin.setEnabled(checked)
-        self.vad_speech_pad_spin.setEnabled(checked)
+    def on_vad_changed(self, _index: int) -> None:
+        vad_enabled = self.is_vad_enabled()
+        self.vad_min_silence_spin.setEnabled(vad_enabled)
+        self.vad_speech_pad_spin.setEnabled(vad_enabled)
 
     def current_runtime_device(self) -> str:
         return str(self.runtime_combo.currentData() or "cpu")
@@ -912,10 +916,13 @@ class MainWindow(QMainWindow):
 
     def current_vad_settings(self) -> VADSettings:
         return VADSettings(
-            enabled=self.vad_checkbox.isChecked(),
+            enabled=self.is_vad_enabled(),
             min_silence_duration_ms=self.vad_min_silence_spin.value(),
             speech_pad_ms=self.vad_speech_pad_spin.value(),
         )
+
+    def is_vad_enabled(self) -> bool:
+        return bool(self.vad_mode_combo.currentData())
 
     def current_runtime_tuning(self) -> RuntimeTuningOptions:
         cpu_threads = self.cpu_threads_spin.value() if self.current_runtime_device() == "cpu" else None
@@ -1047,9 +1054,9 @@ class MainWindow(QMainWindow):
         self.num_workers_spin.setEnabled(enabled)
         self.memory_profile_combo.setEnabled(enabled)
         self.auto_unload_checkbox.setEnabled(True)
-        self.vad_checkbox.setEnabled(enabled)
-        self.vad_min_silence_spin.setEnabled(enabled and self.vad_checkbox.isChecked())
-        self.vad_speech_pad_spin.setEnabled(enabled and self.vad_checkbox.isChecked())
+        self.vad_mode_combo.setEnabled(enabled)
+        self.vad_min_silence_spin.setEnabled(enabled and self.is_vad_enabled())
+        self.vad_speech_pad_spin.setEnabled(enabled and self.is_vad_enabled())
         self.postprocess_checkbox.setEnabled(enabled)
         self.enhanced_postprocess_checkbox.setEnabled(enabled)
         self.start_button.setEnabled(self._model_ready and has_pending and enabled)
@@ -1543,7 +1550,8 @@ class MainWindow(QMainWindow):
         self.log(
             f"작업 시작: {len(source_paths)}개 파일, 장치={self.runtime_combo.currentText()}, "
             f"모델={self.model_combo.currentText()}, 입력 언어={self.input_language_combo.currentText()}, "
-            f"출력 언어={self.output_language_combo.currentText()}"
+            f"출력 언어={self.output_language_combo.currentText()}, "
+            f"VAD={'ON' if self.is_vad_enabled() else 'OFF (Whisper only)'}"
         )
 
     def refresh_queue_progress(self) -> None:

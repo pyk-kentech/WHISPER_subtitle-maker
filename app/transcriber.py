@@ -313,10 +313,13 @@ class TranscriptionEngine:
         media_duration = self.get_media_duration(source_path)
         vad = vad_settings or VADSettings()
         memory_profile = self.runtime_config.memory_profile
-        vad_parameters = {
-            "min_silence_duration_ms": max(0, int(vad.min_silence_duration_ms)),
-            "speech_pad_ms": max(0, int(vad.speech_pad_ms)),
-        }
+        vad_enabled = bool(vad.enabled)
+        vad_parameters = None
+        if vad_enabled:
+            vad_parameters = {
+                "min_silence_duration_ms": max(0, int(vad.min_silence_duration_ms)),
+                "speech_pad_ms": max(0, int(vad.speech_pad_ms)),
+            }
 
         beam_size = 5 if self.runtime_config.device == "cuda" else 3
         chunk_length = 30
@@ -334,7 +337,7 @@ class TranscriptionEngine:
             language=language_code,
             task="transcribe",
             beam_size=beam_size,
-            vad_filter=bool(vad.enabled),
+            vad_filter=vad_enabled,
             vad_parameters=vad_parameters,
             condition_on_previous_text=condition_on_previous_text,
             chunk_length=chunk_length,
