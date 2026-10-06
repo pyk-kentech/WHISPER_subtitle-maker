@@ -4,8 +4,10 @@ from datetime import datetime
 import logging
 import subprocess
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QDragEnterEvent, QDropEvent, QIcon
+from pathlib import Path
+
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -19,6 +21,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMenu,
@@ -56,6 +59,16 @@ from .config import (
     get_preferred_icon_path,
 )
 from .app_logging import get_logger, set_ui_log_callback
+from .audio_splitter import (
+    DEFAULT_SILENCE_SEARCH_SECONDS,
+    SPLIT_SUPPORTED_EXTENSIONS,
+    AudioSplitError,
+    build_cut_points,
+    default_output_dir,
+    format_timestamp,
+    parse_timestamp,
+    probe_audio,
+)
 from .file_queue import (
     QueueItem,
     STATUS_DONE,
@@ -94,6 +107,8 @@ from .translator_store import (
     save_translator_settings,
 )
 from .workers import (
+    AudioSplitJob,
+    AudioSplitWorker,
     ModelDownloadWorker,
     PipelineJob,
     PipelineWorker,
@@ -153,7 +168,12 @@ DROP_TABLE_ACTIVE_STYLE = (
 class DropArea(QFrame):
     files_dropped = Signal(list)
 
-    def __init__(self, label_text: str = "여기에 .mp3 / .mp4 파일을 드래그 앤 드롭") -> None:
+    def __init__(
+        self,
+        label_text: str = "여기에 .mp3 / .mp4 파일을 드래그 앤 드롭",
+        min_height: int = 150,
+        word_wrap: bool = True,
+    ) -> None:
         super().__init__()
         self.setAcceptDrops(True)
         self.setFrameShape(QFrame.StyledPanel)
@@ -169,8 +189,10 @@ class DropArea(QFrame):
         layout = QVBoxLayout(self)
         label = QLabel(label_text)
         label.setAlignment(Qt.AlignCenter)
-        label.setMinimumHeight(150)
-        label.setWordWrap(True)
+        label.setMinimumHeight(min_height)
+        label.setWordWrap(word_wrap)
+        if not word_wrap:
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         label.setStyleSheet("font-size: 18px; font-weight: 600; color: #31455a;")
         layout.addWidget(label)
 
@@ -194,6 +216,72 @@ class DropArea(QFrame):
         if paths:
             self.files_dropped.emit(paths)
         event.acceptProposedAction()
+
+
+class FlowLayout(QLayout):
+    """창 너비가 좁아지면 다음 줄로 넘어가는 가로 배치."""
+
+    def __init__(self, parent=None, spacing: int = 6) -> None:
+        super().__init__(parent)
+        self._items = []
+        self.setSpacing(spacing)
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        height = self._do_layout(rect, test_only=False)
+        # 상위 레이아웃(스플리터 안)이 heightForWidth를 반영하지 않아 줄바꿈된 버튼이 잘리므로 직접 최소 높이를 맞춘다.
+        host = self.parentWidget()
+        if host is not None and host.minimumHeight() != height:
+            host.setMinimumHeight(height)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        area = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x, y, line_height = area.x(), area.y(), 0
+        spacing = self.spacing()
+        for item in self._items:
+            hint = item.sizeHint()
+            if x > area.x() and x + hint.width() > area.right() + 1:
+                x = area.x()
+                y += line_height + spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + spacing
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + margins.bottom()
 
 
 class DropTableWidget(QTableWidget):
@@ -299,6 +387,10 @@ class MainWindow(QMainWindow):
         self._shutdown_scheduled = False
         self._subtitle_items: dict[str, QueueItem] = {}
         self._subtitle_rows_by_path: dict[str, int] = {}
+        self._split_worker: AudioSplitWorker | None = None
+        self._split_source: Path | None = None
+        self._split_duration: float | None = None
+        self._split_output_dir: Path | None = None
 
         self._translator_settings = load_translator_settings()
         self._saved_api_keys_text = "\n".join(load_api_keys())
@@ -325,6 +417,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_main_tab(), "작업")
         self.tabs.addTab(self._build_subtitle_translate_tab(), "자막 번역")
         self.tabs.addTab(self._build_translation_tab(), "번역 설정")
+        self.tabs.addTab(self._build_audio_split_tab(), "음성 분할")
         root_layout.addWidget(self.tabs, 1)
 
         self.setCentralWidget(central)
@@ -459,8 +552,8 @@ class MainWindow(QMainWindow):
         self.queue_progress.setValue(0)
         self.queue_progress.setStyleSheet(GREEN_BAR_STYLE)
 
-        button_row = QHBoxLayout()
-        button_row.setSpacing(6)
+        button_host = QWidget()
+        button_row = FlowLayout(button_host)
         self.add_button = QPushButton("파일 추가")
         self.add_button.clicked.connect(self.open_file_dialog)
         button_row.addWidget(self.add_button)
@@ -494,7 +587,6 @@ class MainWindow(QMainWindow):
         self.unload_model_button = QPushButton("모델 해제")
         self.unload_model_button.clicked.connect(self.unload_model)
         button_row.addWidget(self.unload_model_button)
-        button_row.addStretch(1)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
@@ -503,9 +595,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.model_status_label)
         left_layout.addWidget(self.model_runtime_state_label)
         left_layout.addWidget(self.model_progress)
-        left_layout.addLayout(settings_bar)
         left_layout.addWidget(self.main_settings_summary_label)
-        left_layout.addLayout(button_row)
+        left_layout.addWidget(button_host)
         left_layout.addWidget(self.current_file_label)
         left_layout.addWidget(self.current_stage_label)
         left_layout.addWidget(self.stage_progress)
@@ -514,6 +605,18 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.queue_progress_label)
         left_layout.addWidget(self.queue_progress)
         left_layout.addStretch(1)
+        for label in (
+            self.model_status_label,
+            self.model_runtime_state_label,
+            self.current_file_label,
+            self.current_stage_label,
+            self.translation_progress_label,
+            self.queue_progress_label,
+            self.main_settings_summary_label,
+        ):
+            # 긴 경로·상태 문구가 왼쪽 패널의 최소 너비를 키워 분할선이 움직이지 않던 문제 방지
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            label.setWordWrap(True)
 
         right_splitter = QSplitter(Qt.Vertical)
 
@@ -550,14 +653,270 @@ class MainWindow(QMainWindow):
         right_splitter.setStretchFactor(1, 2)
         right_splitter.setSizes([360, 240])
 
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setWidget(left_panel)
+        left_scroll.viewport().setAutoFillBackground(False)
+        left_panel.setAutoFillBackground(False)
+
         main_splitter = QSplitter(Qt.Horizontal)
-        main_splitter.addWidget(left_panel)
+        main_splitter.addWidget(left_scroll)
         main_splitter.addWidget(right_splitter)
         main_splitter.setStretchFactor(0, 2)
         main_splitter.setStretchFactor(1, 3)
         main_splitter.setSizes([430, 770])
         root_layout.addWidget(main_splitter, 1)
         return content
+
+    def _build_audio_split_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        extensions = " ".join(sorted(SPLIT_SUPPORTED_EXTENSIONS))
+        self.split_drop_area = DropArea(
+            f"여기에 나눌 음성 파일을 드래그 앤 드롭 ({extensions})", min_height=28, word_wrap=False
+        )
+        self.split_drop_area.files_dropped.connect(self.on_split_files_dropped)
+        layout.addWidget(self.split_drop_area)
+
+        file_row = QHBoxLayout()
+        self.split_choose_button = QPushButton("파일 선택")
+        self.split_choose_button.clicked.connect(self.open_split_file_dialog)
+        file_row.addWidget(self.split_choose_button)
+        self.split_file_label = QLabel("선택된 파일 없음")
+        self.split_file_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        file_row.addWidget(self.split_file_label, 1)
+        layout.addLayout(file_row)
+
+        self.split_info_label = QLabel("")
+        self.split_info_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.split_info_label.setStyleSheet("color: #43556a;")
+        layout.addWidget(self.split_info_label)
+
+        options = QHBoxLayout()
+        options.addWidget(QLabel("구간 수"))
+        self.split_count_spin = QSpinBox()
+        self.split_count_spin.setRange(2, 999)
+        self.split_count_spin.setValue(2)
+        self.split_count_spin.valueChanged.connect(self._resize_split_table)
+        options.addWidget(self.split_count_spin)
+        self.split_snap_checkbox = QCheckBox("무음 지점으로 자동 보정  ±")
+        self.split_snap_checkbox.setChecked(True)
+        self.split_snap_checkbox.setToolTip(
+            "입력한 시간 앞뒤로 가장 조용한 지점을 찾아 자릅니다.\n대사·소리가 이어지는 도중에 잘리는 것을 막아 줍니다."
+        )
+        options.addWidget(self.split_snap_checkbox)
+        self.split_snap_spin = QDoubleSpinBox()
+        self.split_snap_spin.setRange(0.1, 3.0)
+        self.split_snap_spin.setSingleStep(0.1)
+        self.split_snap_spin.setDecimals(1)
+        self.split_snap_spin.setValue(DEFAULT_SILENCE_SEARCH_SECONDS)
+        self.split_snap_spin.setSuffix(" 초 이내")
+        self.split_snap_checkbox.toggled.connect(self.split_snap_spin.setEnabled)
+        options.addWidget(self.split_snap_spin)
+        options.addStretch(1)
+        layout.addLayout(options)
+
+        hint = QLabel("각 구간의 끝 시간만 입력 (예: 03:25, 12:34.50, 1:02:03) · 첫 구간은 00:00부터, 마지막 구간은 파일 끝까지")
+        hint.setToolTip(
+            "제목은 파일 이름과 태그 제목으로 쓰이며, 비워 두면 원래 파일 이름에 번호를 붙입니다.\n"
+            "다시 인코딩하지 않아 음질과 표지 이미지가 그대로 유지됩니다."
+        )
+        hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        hint.setStyleSheet("color: #5b6b7b;")
+        layout.addWidget(hint)
+
+        self.split_table = QTableWidget(0, 2)
+        self.split_table.setHorizontalHeaderLabels(["제목", "끝 시간"])
+        self.split_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.split_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.split_table.setColumnWidth(1, 170)
+        self.split_table.setAlternatingRowColors(True)
+        self.split_table.setMinimumHeight(90)
+        self.split_table.setToolTip("제목은 파일 이름과 태그 제목으로 쓰입니다. 비워 두면 원래 파일 이름에 번호를 붙입니다.")
+
+        split_action_host = QWidget()
+        action_row = QHBoxLayout(split_action_host)
+        action_row.setContentsMargins(0, 0, 0, 0)
+        self.split_start_button = QPushButton("분할 시작")
+        self.split_start_button.clicked.connect(self.start_audio_split)
+        action_row.addWidget(self.split_start_button)
+        self.split_open_button = QPushButton("저장 폴더 열기")
+        self.split_open_button.clicked.connect(self.open_split_output_dir)
+        action_row.addWidget(self.split_open_button)
+        self.split_output_label = QLabel("")
+        self.split_output_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        action_row.addWidget(self.split_output_label, 1)
+
+        self.split_progress = QProgressBar()
+        self.split_progress.setRange(0, 100)
+        self.split_progress.setValue(0)
+        self.split_progress.setStyleSheet(GREEN_BAR_STYLE)
+
+        self.split_log_view = QTextEdit()
+        self.split_log_view.setReadOnly(True)
+        self.split_log_view.setMinimumHeight(40)
+
+        split_splitter = QSplitter(Qt.Vertical)
+        split_splitter.addWidget(self.split_table)
+        split_splitter.addWidget(self.split_log_view)
+        split_splitter.setChildrenCollapsible(False)
+        split_splitter.setStretchFactor(0, 3)
+        split_splitter.setStretchFactor(1, 1)
+        split_splitter.setSizes([300, 100])
+
+        layout.addWidget(split_splitter, 1)
+        layout.addWidget(split_action_host)
+        layout.addWidget(self.split_progress)
+
+        self._resize_split_table(self.split_count_spin.value())
+        self._refresh_split_controls()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        scroll.viewport().setAutoFillBackground(False)
+        content.setAutoFillBackground(False)
+        return scroll
+
+    def open_split_file_dialog(self) -> None:
+        patterns = " ".join(f"*{extension}" for extension in sorted(SPLIT_SUPPORTED_EXTENSIONS))
+        path, _ = QFileDialog.getOpenFileName(self, "나눌 음성 파일 선택", "", f"음성 파일 ({patterns})")
+        if path:
+            self.set_split_source(Path(path))
+
+    def on_split_files_dropped(self, paths: list[str]) -> None:
+        if len(paths) > 1:
+            self.split_log_view.append("한 번에 한 파일만 나눌 수 있어 첫 번째 파일만 사용합니다.")
+        self.set_split_source(Path(paths[0]))
+
+    def set_split_source(self, path: Path) -> None:
+        if self._split_worker is not None and self._split_worker.isRunning():
+            return
+        if path.suffix.lower() not in SPLIT_SUPPORTED_EXTENSIONS:
+            QMessageBox.warning(self, APP_NAME, f"지원하지 않는 파일 형식입니다: {path.name}")
+            return
+        try:
+            info = probe_audio(path)
+        except AudioSplitError as exc:
+            QMessageBox.warning(self, APP_NAME, f"{path.name}\n{exc}")
+            return
+
+        self._split_source = path
+        self._split_duration = info.duration
+        self._split_output_dir = default_output_dir(path)
+        self.split_file_label.setText(str(path))
+        self.split_file_label.setToolTip(str(path))
+        details = [f"길이 {format_timestamp(info.duration, True)}", info.codec]
+        if info.bit_rate:
+            details.append(f"{info.bit_rate // 1000} kbps")
+        if info.sample_rate:
+            details.append(f"{info.sample_rate} Hz")
+        details.append("표지 있음" if info.has_cover else "표지 없음")
+        details.append(f"저장 형식 {info.output_suffix}")
+        if info.has_video:
+            details.append("영상은 빼고 음성만 저장")
+        self.split_info_label.setText(" | ".join(details))
+        self.split_output_label.setText(f"저장 위치: {self._split_output_dir}")
+        self.split_output_label.setToolTip(str(self._split_output_dir))
+        self.split_progress.setValue(0)
+        self.split_log_view.append(f"파일 선택: {path}")
+        self._resize_split_table(self.split_count_spin.value())
+        self._refresh_split_controls()
+
+    def _resize_split_table(self, count: int) -> None:
+        table = self.split_table
+        table.setRowCount(count)
+        for row in range(count):
+            for column in (0, 1):
+                if table.item(row, column) is None:
+                    table.setItem(row, column, QTableWidgetItem(""))
+            end_item = table.item(row, 1)
+            if row == count - 1:
+                end_text = format_timestamp(self._split_duration, True) if self._split_duration is not None else ""
+                end_item.setText(f"{end_text} (파일 끝)".strip())
+                end_item.setFlags(end_item.flags() & ~Qt.ItemIsEditable)
+                end_item.setForeground(QColor("#7a8794"))
+                end_item.setData(Qt.UserRole, "auto")
+            elif end_item.data(Qt.UserRole) == "auto":
+                end_item.setText("")
+                end_item.setFlags(end_item.flags() | Qt.ItemIsEditable)
+                end_item.setData(Qt.ForegroundRole, None)
+                end_item.setData(Qt.UserRole, None)
+        table.setVerticalHeaderLabels([str(row) for row in range(1, count + 1)])
+
+    def start_audio_split(self) -> None:
+        if self._split_source is None or self._split_duration is None:
+            QMessageBox.information(self, APP_NAME, "먼저 나눌 음성 파일을 선택하세요.")
+            return
+        count = self.split_count_spin.value()
+        titles = [self.split_table.item(row, 0).text().strip() for row in range(count)]
+        end_times: list[float] = []
+        for row in range(count - 1):
+            try:
+                end_times.append(parse_timestamp(self.split_table.item(row, 1).text()))
+            except ValueError as exc:
+                self.split_table.setCurrentCell(row, 1)
+                QMessageBox.warning(self, APP_NAME, f"{row + 1}번 구간 끝 시간: {exc}")
+                return
+        try:
+            build_cut_points(end_times, self._split_duration)
+        except AudioSplitError as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+
+        search = self.split_snap_spin.value() if self.split_snap_checkbox.isChecked() else 0.0
+        job = AudioSplitJob(
+            source_path=self._split_source,
+            titles=titles,
+            end_times=end_times,
+            silence_search_seconds=search,
+            output_dir=self._split_output_dir or default_output_dir(self._split_source),
+        )
+        self._split_worker = AudioSplitWorker(job, self)
+        self._split_worker.progress_changed.connect(self.split_progress.setValue)
+        self._split_worker.log_message.connect(self.split_log_view.append)
+        self._split_worker.finished_success.connect(self.on_audio_split_finished)
+        self._split_worker.failed.connect(self.on_audio_split_failed)
+        self._split_worker.finished.connect(self._refresh_split_controls)
+        self.split_progress.setValue(0)
+        self.split_log_view.append(f"분할 시작: {self._split_source.name} -> {count}개 구간")
+        self._split_worker.start()
+        self._refresh_split_controls()
+
+    def on_audio_split_finished(self, paths: list[str]) -> None:
+        self.split_log_view.append(f"완료: {len(paths)}개 파일 저장 -> {self._split_output_dir}")
+        self.log(f"음성 분할 완료: {self._split_source} -> {len(paths)}개 파일")
+
+    def on_audio_split_failed(self, message: str) -> None:
+        self.split_log_view.append(f"실패: {message}")
+        self.log(f"음성 분할 실패: {message}", logging.ERROR)
+        QMessageBox.warning(self, APP_NAME, f"음성 분할에 실패했습니다.\n{message}")
+
+    def open_split_output_dir(self) -> None:
+        if self._split_output_dir is not None and self._split_output_dir.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._split_output_dir)))
+
+    def _refresh_split_controls(self) -> None:
+        running = self._split_worker is not None and self._split_worker.isRunning()
+        for widget in (
+            self.split_drop_area,
+            self.split_choose_button,
+            self.split_count_spin,
+            self.split_table,
+            self.split_snap_checkbox,
+        ):
+            widget.setEnabled(not running)
+        self.split_snap_spin.setEnabled(not running and self.split_snap_checkbox.isChecked())
+        self.split_start_button.setEnabled(not running and self._split_source is not None)
+        self.split_open_button.setEnabled(self._split_output_dir is not None and self._split_output_dir.is_dir())
 
     def _build_settings_menu_button(self, title: str, menu: QMenu) -> QToolButton:
         button = QToolButton()

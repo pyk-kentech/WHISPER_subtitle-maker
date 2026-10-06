@@ -8,6 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from .audio_splitter import build_cut_points, find_quiet_cut_points, format_timestamp, probe_audio, split_audio
 from .cuda_runtime import ensure_cuda_runtime
 from .deepl_translator import DeepLConfig, DeepLTranslator
 from .dictionary_pack import ensure_dictionary_pack
@@ -73,6 +74,15 @@ class SubtitleTranslationJob:
     translator_settings: TranslatorSettings
     api_keys: list[str]
     deepl_api_key: str
+
+
+@dataclass(slots=True)
+class AudioSplitJob:
+    source_path: Path
+    titles: list[str]
+    end_times: list[float]
+    silence_search_seconds: float
+    output_dir: Path
 
 
 @dataclass(slots=True)
@@ -783,3 +793,54 @@ class SubtitleTranslationWorker(QThread):
             self.failed.emit(str(exc) or exc.__class__.__name__)
 
 
+class AudioSplitWorker(QThread):
+    progress_changed = Signal(int)
+    log_message = Signal(str)
+    finished_success = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, job: AudioSplitJob, parent=None) -> None:
+        super().__init__(parent)
+        self.job = job
+
+    def run(self) -> None:
+        try:
+            info = probe_audio(self.job.source_path)
+            cut_points = build_cut_points(self.job.end_times, info.duration)
+            search = self.job.silence_search_seconds
+            if search > 0:
+                self.log_message.emit(f"자르는 지점 앞뒤 {search:.1f}초 안에서 가장 조용한 곳을 찾는 중...")
+                snapped = find_quiet_cut_points(
+                    self.job.source_path,
+                    cut_points,
+                    info.duration,
+                    search,
+                    lambda ratio: self.progress_changed.emit(int(ratio * 30)),
+                )
+                for index, (original, (point, before, after)) in enumerate(zip(cut_points, snapped), start=1):
+                    shift = point - original
+                    if abs(shift) < 0.005:
+                        self.log_message.emit(f"{index}번 구간 끝 {format_timestamp(original, True)} | 보정 없음 (이미 가장 조용한 지점)")
+                    else:
+                        self.log_message.emit(
+                            f"{index}번 구간 끝 {format_timestamp(original, True)} -> {format_timestamp(point, True)} "
+                            f"({shift:+.2f}초, 음량 {before:.0f} dB -> {after:.0f} dB)"
+                        )
+                cut_points = build_cut_points([point for point, _, _ in snapped], info.duration)
+            self.progress_changed.emit(30)
+            results = split_audio(
+                self.job.source_path,
+                info,
+                self.job.titles,
+                cut_points,
+                self.job.output_dir,
+                lambda ratio: self.progress_changed.emit(30 + int(ratio * 70)),
+            )
+            for result in results:
+                self.log_message.emit(
+                    f"{result.path.name} | {format_timestamp(result.start, True)} ~ {format_timestamp(result.end, True)}"
+                )
+            self.progress_changed.emit(100)
+            self.finished_success.emit([str(result.path) for result in results])
+        except Exception as exc:
+            self.failed.emit(str(exc) or exc.__class__.__name__)
