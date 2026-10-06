@@ -14,6 +14,7 @@ Windows 전용 GUI 프로그램입니다. `.mp3`, `.mp4` 파일에서 자막을 
   - `faster-whisper-XXL-medium`
   - `faster-whisper-XXL-large-v3`
   - `faster-whisper-XXL-large-v3-turbo`
+- 번역 사용 여부 선택 (끄면 Gemini 키 없이 원문 자막만 생성)
 - 입력 언어 선택 지원
   - `auto`, `ja`, `en`, `ko`, `zh`
 - 출력 번역 언어 선택 지원
@@ -44,6 +45,9 @@ Windows 전용 GUI 프로그램입니다. `.mp3`, `.mp4` 파일에서 자막을 
   - `D:\media\a.mp4 -> D:\media\a.srt`
   - `E:\audio\b.mp3 -> E:\audio\b.srt`
 - 기존 `.srt`가 있으면 스킵합니다.
+- 번역을 사용하면 번역 전 원문 자막도 `<basename>.<원문 언어 코드>.srt`로 함께 저장합니다. (예: `a.ja.srt`)
+- 번역에 실패하면 원문 자막만 저장하고 실패로 표시합니다. 다시 시작하면 원문 자막(`a.ja.srt`, 예전 버전의 `a.jp.srt`)을 재사용해 음성 인식 없이 번역만 다시 시도합니다.
+- 일부 줄만 번역에 실패하면 그 줄은 원문으로 남기고 완료 메시지에 줄 수를 표시합니다.
 
 ## SRT 형식
 
@@ -83,6 +87,8 @@ Dongeum sub maker/
     app_logging.py
     config.py
     credential_store.py
+    cuda_runtime.py
+    deepl_translator.py
     dictionary_pack.py
     file_queue.py
     gemini_translator.py
@@ -123,8 +129,15 @@ Dongeum sub maker/
 
 - Gemini 요청 간 지연 시간 설정 지원
 - adaptive throttling 적용
-- 429 / quota 발생 시 exponential backoff 적용
+- 429 / 일시 장애 시 다른 키·모델로 즉시 전환하고, 모두 막히면 60초씩 최대 3번 대기 후 그 파일의 Gemini 번역을 중단 (할당량 소진 시 남은 파일은 Gemini를 건너뜀)
+- 키 오류·없는 모델은 청크를 쪼개 재시도하지 않고 바로 다음 후보로 전환, 404 모델은 이후 요청에서 제외
+- DeepL 폴백을 켜면 Gemini가 번역하지 못한 줄만 DeepL로 채움
+- 검열(안전 필터)·응답 형식 오류는 키를 바꿔 재시도하지 않고 청크를 반씩 나눠 문제 줄만 찾아낸 뒤, 그 줄만 다른 모델로 한 번씩 시도 (실패 시 원문 유지 또는 DeepL)
+- 기본 모델 순서는 무료 하루 한도가 큰 `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` → `gemini-3.6-flash` → `gemini-3-flash-preview` (무료 한도는 모델별로 따로 계산)
+- 요청마다 입력/출력/thinking 토큰 수를 로그로 남기고 작업 끝에 누적 합계 표시
 - 여러 API 키를 순환 사용
+- 응답의 각 줄에 원문을 그대로 되돌려 받아(`<o>원문</o>번역`) 같은 ID의 원문과 대조하고, 줄이 밀린 부분은 그 줄만 다시 요청
+- 청크마다 직전 대사 몇 줄을 번역하지 않는 참고 문맥으로 함께 전달
 
 ## 라이선스
 

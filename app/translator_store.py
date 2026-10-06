@@ -13,10 +13,15 @@ from .config import (
     DEFAULT_TRANSLATION_SYSTEM_PROMPT,
     DEFAULT_TRANSLATION_TEMPERATURE,
     DEFAULT_TRANSLATION_TOP_P,
+    LEGACY_TRANSLATION_CHUNK_SIZE,
+    LEGACY_TRANSLATION_SYSTEM_PROMPT,
     get_translator_keys_path,
     get_translator_settings_path,
 )
 from .credential_store import CredentialStoreError, delete_secret, load_secret, save_secret
+
+
+SETTINGS_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -42,16 +47,25 @@ def load_translator_settings() -> TranslatorSettings:
     except Exception:
         return TranslatorSettings()
 
+    chunk_size = int(data.get("chunk_size", DEFAULT_TRANSLATION_CHUNK_SIZE))
+    system_prompt = str(data.get("system_prompt", DEFAULT_TRANSLATION_SYSTEM_PROMPT))
+    if int(data.get("settings_version", 1)) < SETTINGS_VERSION:
+        # 이전 버전 기본값을 그대로 쓰던 경우에만 새 기본값으로 올린다. 사용자가 바꾼 값은 유지.
+        if chunk_size == LEGACY_TRANSLATION_CHUNK_SIZE:
+            chunk_size = DEFAULT_TRANSLATION_CHUNK_SIZE
+        if system_prompt == LEGACY_TRANSLATION_SYSTEM_PROMPT:
+            system_prompt = DEFAULT_TRANSLATION_SYSTEM_PROMPT
+
     return TranslatorSettings(
         preferred_model=str(data.get("preferred_model", "")),
         target_language=str(data.get("target_language", DEFAULT_OUTPUT_LANGUAGE)),
         use_deepl_fallback=bool(data.get("use_deepl_fallback", False)),
-        chunk_size=int(data.get("chunk_size", DEFAULT_TRANSLATION_CHUNK_SIZE)),
+        chunk_size=chunk_size,
         request_delay_seconds=float(data.get("request_delay_seconds", DEFAULT_TRANSLATION_REQUEST_DELAY_SECONDS)),
         temperature=float(data.get("temperature", DEFAULT_TRANSLATION_TEMPERATURE)),
         top_p=float(data.get("top_p", DEFAULT_TRANSLATION_TOP_P)),
         reasoning_level=str(data.get("reasoning_level", DEFAULT_TRANSLATION_REASONING_LEVEL)),
-        system_prompt=str(data.get("system_prompt", DEFAULT_TRANSLATION_SYSTEM_PROMPT)),
+        system_prompt=system_prompt,
         translation_note=str(data.get("translation_note", "")),
     )
 
@@ -59,7 +73,8 @@ def load_translator_settings() -> TranslatorSettings:
 def save_translator_settings(settings: TranslatorSettings) -> None:
     path = get_translator_settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(settings), ensure_ascii=False, indent=2), encoding="utf-8")
+    data = {**asdict(settings), "settings_version": SETTINGS_VERSION}
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_api_keys() -> list[str]:

@@ -244,6 +244,7 @@ class TranscriptionEngine:
     def __init__(self, runtime_config: RuntimeConfig, model_key: str = DEFAULT_MODEL_KEY) -> None:
         self.runtime_config = runtime_config
         self.model_key = model_key
+        self.last_detected_language: str | None = None
 
     def _cache_key(self) -> tuple[str, str, str, int, int]:
         return (
@@ -332,7 +333,7 @@ class TranscriptionEngine:
             chunk_length = 15
             condition_on_previous_text = False
 
-        segments, _ = model.transcribe(
+        segments, info = model.transcribe(
             str(source_path),
             language=language_code,
             task="transcribe",
@@ -342,6 +343,7 @@ class TranscriptionEngine:
             condition_on_previous_text=condition_on_previous_text,
             chunk_length=chunk_length,
         )
+        self.last_detected_language = getattr(info, "language", None) or language_code
 
         result: list[SubtitleSegment] = []
         last_percent = -1

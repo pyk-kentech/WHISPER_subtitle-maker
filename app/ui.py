@@ -368,6 +368,9 @@ class MainWindow(QMainWindow):
         self.output_language_combo.setCurrentIndex(max(0, self.output_language_combo.findData(self._translator_settings.target_language)))
         self.output_language_combo.currentIndexChanged.connect(self.mark_translation_inputs_dirty)
 
+        self.translate_checkbox = QCheckBox("번역 사용")
+        self.translate_checkbox.setChecked(True)
+
         self.postprocess_checkbox = QCheckBox("기본 후처리")
         self.postprocess_checkbox.setChecked(True)
         self.postprocess_checkbox.toggled.connect(self.on_postprocess_changed)
@@ -594,6 +597,7 @@ class MainWindow(QMainWindow):
         language_menu = menu.addMenu("언어")
         self._add_widget_action(language_menu, "입력 언어", self.input_language_combo)
         self._add_widget_action(language_menu, "출력 언어", self.output_language_combo)
+        self._add_widget_action(language_menu, "번역", self.translate_checkbox)
         return menu
 
     def _create_performance_settings_menu(self) -> QMenu:
@@ -625,6 +629,7 @@ class MainWindow(QMainWindow):
         self.model_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
         self.input_language_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
         self.output_language_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.translate_checkbox.toggled.connect(self.refresh_main_settings_summary)
         self.compute_type_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
         self.cpu_threads_spin.valueChanged.connect(self.refresh_main_settings_summary)
         self.num_workers_spin.valueChanged.connect(self.refresh_main_settings_summary)
@@ -642,7 +647,8 @@ class MainWindow(QMainWindow):
             return
         summary = (
             f"실행 {self.runtime_combo.currentText()} | 모델 {self.model_combo.currentText()} | "
-            f"{self.input_language_combo.currentText()} -> {self.output_language_combo.currentText()} | "
+            f"{self.input_language_combo.currentText()} -> "
+            f"{self.output_language_combo.currentText() if self.translate_checkbox.isChecked() else '번역 안 함'} | "
             f"compute {self.compute_type_combo.currentText()} | CPU {self.cpu_threads_spin.value()} | "
             f"workers {self.num_workers_spin.value()} | RAM {self.memory_profile_combo.currentText()} | "
             f"VAD {'ON' if self.is_vad_enabled() else 'OFF'} | "
@@ -1174,6 +1180,7 @@ class MainWindow(QMainWindow):
         self.vad_speech_pad_spin.setEnabled(enabled and self.is_vad_enabled())
         self.postprocess_checkbox.setEnabled(enabled)
         self.enhanced_postprocess_checkbox.setEnabled(enabled)
+        self.translate_checkbox.setEnabled(enabled)
         self.start_button.setEnabled(self._model_ready and has_pending and enabled)
         self.pause_button.setEnabled(processing_running and not getattr(self._pipeline_worker, "_pause_requested", False))
         self.resume_button.setEnabled(processing_running and getattr(self._pipeline_worker, "_pause_requested", False))
@@ -1415,16 +1422,26 @@ class MainWindow(QMainWindow):
         elif status == STATUS_REMOVED:
             self._remove_subtitle_paths([source_path])
 
+    def _check_translation_keys(self, api_keys: list[str], deepl_api_key: str) -> bool:
+        use_deepl = self.translator_settings().use_deepl_fallback
+        if use_deepl and not deepl_api_key:
+            self.tabs.setCurrentIndex(2)
+            QMessageBox.warning(self, APP_NAME, "DeepL 폴백을 사용하려면 DeepL Free API 키를 입력해 주세요.")
+            return False
+        if not api_keys and not use_deepl:
+            self.tabs.setCurrentIndex(2)
+            QMessageBox.warning(
+                self,
+                APP_NAME,
+                "번역 설정 탭에 Gemini API 키를 입력해 주세요.\n번역 없이 자막만 만들려면 작업 설정의 '번역 사용'을 끄세요.",
+            )
+            return False
+        return True
+
     def start_subtitle_translation(self) -> None:
         api_keys = load_api_keys()
         deepl_api_key = load_deepl_api_key()
-        if not api_keys:
-            self.tabs.setCurrentIndex(2)
-            QMessageBox.warning(self, APP_NAME, "번역 설정 탭에 Gemini API 키를 입력해 주세요.")
-            return
-        if self.translator_settings().use_deepl_fallback and not deepl_api_key:
-            self.tabs.setCurrentIndex(2)
-            QMessageBox.warning(self, APP_NAME, "DeepL 폴백을 사용하려면 DeepL Free API 키를 입력해 주세요.")
+        if not self._check_translation_keys(api_keys, deepl_api_key):
             return
 
         source_paths = [path for path, item in self._subtitle_items.items() if item.status in {STATUS_PENDING, STATUS_FAILED}]
@@ -1600,15 +1617,10 @@ class MainWindow(QMainWindow):
         self.update_controls()
 
     def start_pipeline(self) -> None:
-        api_keys = load_api_keys()
-        deepl_api_key = load_deepl_api_key()
-        if not api_keys:
-            self.tabs.setCurrentIndex(1)
-            QMessageBox.warning(self, APP_NAME, "번역 설정 탭에 Gemini API 키를 입력해 주세요.")
-            return
-        if self.translator_settings().use_deepl_fallback and not deepl_api_key:
-            self.tabs.setCurrentIndex(1)
-            QMessageBox.warning(self, APP_NAME, "DeepL 폴백을 사용하려면 DeepL Free API 키를 입력해 주세요.")
+        enable_translation = self.translate_checkbox.isChecked()
+        api_keys = load_api_keys() if enable_translation else []
+        deepl_api_key = load_deepl_api_key() if enable_translation else ""
+        if enable_translation and not self._check_translation_keys(api_keys, deepl_api_key):
             return
         if not self._model_ready:
             self.log("모델 준비 전에는 작업을 시작할 수 없습니다.")
@@ -1648,6 +1660,7 @@ class MainWindow(QMainWindow):
             translator_settings=self.translator_settings(),
             api_keys=api_keys,
             deepl_api_key=deepl_api_key,
+            enable_translation=enable_translation,
         )
         self._pipeline_worker = PipelineWorker(job, self)
         self._pipeline_worker.item_status_changed.connect(self.update_item_status)
@@ -1665,7 +1678,7 @@ class MainWindow(QMainWindow):
         self.log(
             f"작업 시작: {len(source_paths)}개 파일, 장치={self.runtime_combo.currentText()}, "
             f"모델={self.model_combo.currentText()}, 입력 언어={self.input_language_combo.currentText()}, "
-            f"출력 언어={self.output_language_combo.currentText()}, "
+            f"출력 언어={self.output_language_combo.currentText() if enable_translation else '번역 안 함'}, "
             f"VAD={'ON' if self.is_vad_enabled() else 'OFF (Whisper only)'}"
         )
 

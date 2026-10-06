@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Callable
@@ -48,7 +49,7 @@ def _write_manifest(data: dict[str, str]) -> None:
     manifest_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _get_package_metadata() -> tuple[str, str, str]:
+def _get_package_metadata() -> tuple[str, str, str, str]:
     with urllib.request.urlopen(f"https://pypi.org/pypi/{DICT_PACKAGE_NAME}/json") as response:
         metadata = json.load(response)
 
@@ -56,18 +57,29 @@ def _get_package_metadata() -> tuple[str, str, str]:
     for file_info in metadata["releases"][version]:
         filename = str(file_info["filename"])
         if "py3-none-any.whl" in filename and filename.endswith(".whl"):
-            return version, str(file_info["url"]), filename
+            return version, str(file_info["url"]), filename, str(file_info["digests"]["sha256"])
     raise RuntimeError(f"Wheel not found for {DICT_PACKAGE_NAME}")
+
+
+def _sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _download_file(
     url: str,
     destination: Path,
     filename: str,
+    expected_sha256: str,
     progress_callback: ProgressCallback,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url) as response, destination.open("wb") as stream:
+    partial_path = destination.with_name(destination.name + ".part")
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(url) as response, partial_path.open("wb") as stream:
         total_bytes = int(response.headers.get("Content-Length", "0"))
         downloaded_bytes = 0
         chunk_size = 1024 * 1024
@@ -78,8 +90,14 @@ def _download_file(
             if not chunk:
                 break
             stream.write(chunk)
+            digest.update(chunk)
             downloaded_bytes += len(chunk)
             progress_callback(downloaded_bytes, total_bytes, filename, downloaded_bytes, total_bytes)
+
+    if digest.hexdigest() != expected_sha256:
+        partial_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Downloaded file failed SHA-256 verification: {filename}")
+    partial_path.replace(destination)
 
 
 def _extract_dictionary(wheel_path: Path, status_callback: StatusCallback) -> Path:
@@ -95,8 +113,10 @@ def _extract_dictionary(wheel_path: Path, status_callback: StatusCallback) -> Pa
         if member_name is None:
             raise RuntimeError("Dictionary file not found in downloaded pack.")
 
-        with archive.open(member_name) as source_stream, target_path.open("wb") as target_stream:
+        partial_path = target_path.with_name(target_path.name + ".part")
+        with archive.open(member_name) as source_stream, partial_path.open("wb") as target_stream:
             target_stream.write(source_stream.read())
+        partial_path.replace(target_path)
 
     status_callback(f"일본어 사전팩 설치 완료: {target_path}")
     return target_path
@@ -116,13 +136,16 @@ def ensure_dictionary_pack(
     cache_dir.mkdir(parents=True, exist_ok=True)
     pack_dir.mkdir(parents=True, exist_ok=True)
 
-    version, url, filename = _get_package_metadata()
+    version, url, filename, sha256 = _get_package_metadata()
     wheel_path = cache_dir / filename
     manifest = _read_manifest()
 
+    if wheel_path.is_file() and _sha256_of(wheel_path) != sha256:
+        status_callback(f"손상된 사전팩 캐시를 다시 받습니다: {filename}")
+        wheel_path.unlink()
     if not wheel_path.is_file():
         status_callback(f"일본어 사전팩 다운로드 중: {filename}")
-        _download_file(url, wheel_path, filename, progress_callback)
+        _download_file(url, wheel_path, filename, sha256, progress_callback)
     else:
         progress_callback(1, 1, filename, 1, 1)
         status_callback(f"일본어 사전팩 캐시 사용: {filename}")

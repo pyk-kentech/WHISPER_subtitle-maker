@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import urllib.request
 import zipfile
 
 import ctranslate2
+from packaging.version import InvalidVersion, Version
 
 from .config import get_cuda_cache_dir, get_cuda_runtime_dir
 
@@ -26,6 +28,9 @@ REQUIRED_DLL_PREFIXES = (
     "cudart64_12",
     "cudnn64_9",
 )
+PACKAGE_MAJOR_VERSIONS = {
+    "nvidia-cudnn-cu12": 9,
+}
 
 
 def get_cuda_device_count() -> int:
@@ -93,26 +98,55 @@ def add_cuda_runtime_to_path() -> Path | None:
     return bin_dir
 
 
-def _get_package_metadata(package_name: str) -> tuple[str, str, str]:
+def _select_version(package_name: str, metadata: dict) -> str:
+    major = PACKAGE_MAJOR_VERSIONS.get(package_name)
+    latest = str(metadata["info"]["version"])
+    if major is None:
+        return latest
+    candidates: list[Version] = []
+    for version_text, files in metadata["releases"].items():
+        try:
+            version = Version(version_text)
+        except InvalidVersion:
+            continue
+        if version.major == major and not version.is_prerelease and files:
+            candidates.append(version)
+    if not candidates:
+        raise RuntimeError(f"No {major}.x release found for {package_name}")
+    return str(max(candidates))
+
+
+def _get_package_metadata(package_name: str) -> tuple[str, str, str, str]:
     with urllib.request.urlopen(f"https://pypi.org/pypi/{package_name}/json") as response:
         metadata = json.load(response)
 
-    version = str(metadata["info"]["version"])
+    version = _select_version(package_name, metadata)
     for file_info in metadata["releases"][version]:
         filename = str(file_info["filename"])
         if "win_amd64" in filename and filename.endswith(".whl"):
-            return version, str(file_info["url"]), filename
+            return version, str(file_info["url"]), filename, str(file_info["digests"]["sha256"])
     raise RuntimeError(f"Windows wheel not found for {package_name}")
+
+
+def _sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _download_file(
     url: str,
     destination: Path,
     filename: str,
+    expected_sha256: str,
     progress_callback: ProgressCallback,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url) as response, destination.open("wb") as stream:
+    partial_path = destination.with_name(destination.name + ".part")
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(url) as response, partial_path.open("wb") as stream:
         total_bytes = int(response.headers.get("Content-Length", "0"))
         downloaded_bytes = 0
         chunk_size = 1024 * 1024
@@ -123,8 +157,14 @@ def _download_file(
             if not chunk:
                 break
             stream.write(chunk)
+            digest.update(chunk)
             downloaded_bytes += len(chunk)
             progress_callback(downloaded_bytes, total_bytes, filename, downloaded_bytes, total_bytes)
+
+    if digest.hexdigest() != expected_sha256:
+        partial_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Downloaded file failed SHA-256 verification: {filename}")
+    partial_path.replace(destination)
 
 
 def _extract_dlls(wheel_path: Path, status_callback: StatusCallback) -> int:
@@ -140,8 +180,10 @@ def _extract_dlls(wheel_path: Path, status_callback: StatusCallback) -> int:
                 continue
 
             target_path = bin_dir / Path(member.filename).name
-            with archive.open(member) as source_stream, target_path.open("wb") as target_stream:
+            partial_path = target_path.with_name(target_path.name + ".part")
+            with archive.open(member) as source_stream, partial_path.open("wb") as target_stream:
                 target_stream.write(source_stream.read())
+            partial_path.replace(target_path)
             extracted_count += 1
 
     status_callback(f"CUDA DLL 추출 완료: {wheel_path.name} ({extracted_count}개)")
@@ -171,12 +213,16 @@ def ensure_cuda_runtime(
 
     package_versions: dict[str, str] = {}
     for package_name in CUDA_PACKAGES:
-        version, url, filename = _get_package_metadata(package_name)
+        version, url, filename, sha256 = _get_package_metadata(package_name)
         package_versions[package_name] = version
         wheel_path = cache_dir / filename
+        if wheel_path.is_file() and _sha256_of(wheel_path) != sha256:
+            status_callback(f"손상된 CUDA 런타임 캐시를 다시 받습니다: {filename}")
+            wheel_path.unlink()
+            installed_versions.pop(package_name, None)
         if not wheel_path.is_file():
             status_callback(f"CUDA 런타임 다운로드 중: {filename}")
-            _download_file(url, wheel_path, filename, progress_callback)
+            _download_file(url, wheel_path, filename, sha256, progress_callback)
         else:
             progress_callback(1, 1, filename, 1, 1)
             status_callback(f"CUDA 런타임 캐시 사용: {filename}")

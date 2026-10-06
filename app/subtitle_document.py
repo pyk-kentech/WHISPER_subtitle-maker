@@ -47,14 +47,15 @@ def _parse_srt(lines: list[str]) -> list[LineRecord]:
     cue_index = 0
     text_index = 0
 
-    for raw_line in lines:
+    for position, raw_line in enumerate(lines):
         stripped = raw_line.strip()
         if not stripped:
             records.append(LineRecord(text=raw_line, translatable=False))
             active_text = False
             text_index = 0
             continue
-        if stripped.isdigit():
+        next_is_timing = position + 1 < len(lines) and "-->" in lines[position + 1]
+        if stripped.isdigit() and (not active_text or next_is_timing):
             cue_index += 1
             records.append(LineRecord(text=raw_line, translatable=False))
             active_text = False
