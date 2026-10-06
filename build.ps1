@@ -30,8 +30,7 @@ $pyinstallerArgs = @(
   "--collect-all", "av",
   "--collect-all", "tokenizers",
   "--collect-all", "huggingface_hub",
-  "--collect-all", "google.generativeai",
-  "--collect-all", "google.ai.generativelanguage",
+  "--collect-all", "google.genai",
   "--collect-all", "dotenv"
 )
 

@@ -5,16 +5,14 @@ import random
 import re
 import time
 import unicodedata
-import warnings
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Callable
 
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore", FutureWarning)
-    import google.generativeai as genai
-
-from google.generativeai.types import HarmBlockThreshold, HarmCategory
+import httpx
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 
 from .config import (
     DEFAULT_TRANSLATION_MODELS,
@@ -35,6 +33,19 @@ CONTEXT_CONTENT_TEMPLATE = """<main id=\"context\">
 {{slot}}
 </main>
 """
+
+REQUEST_TIMEOUT_MS = 1_200_000
+THINKING_LEVELS = ["minimal", "low", "medium", "high"]
+_SAFETY_SETTINGS = [
+    genai_types.SafetySetting(category=category, threshold=genai_types.HarmBlockThreshold.BLOCK_NONE)
+    for category in (
+        genai_types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+        genai_types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        genai_types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        genai_types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+    )
+]
+_BLOCKED_FINISH_REASONS = {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"}
 
 _LINE_PATTERN = re.compile(r'<p id="([^"]+)">(.*?)</p>', re.DOTALL)
 _ECHO_PATTERN = re.compile(r"\s*<o>(.*?)</o>(.*)\Z", re.DOTALL)
@@ -105,6 +116,8 @@ class GeminiTranslator:
         self._unavailable_models: set[str] = set()
         self._quota_exhausted = False
         self.token_usage = {"prompt": 0, "output": 0, "thinking": 0}
+        self._clients: dict[str, genai.Client] = {}
+        self._thinking_levels: dict[str, str | None] = {}
         self._adaptive_delay_seconds = max(
             self.config.min_adaptive_delay_seconds,
             float(self.config.request_delay_seconds),
@@ -240,8 +253,7 @@ class GeminiTranslator:
         user_prompt = self._build_user_prompt(chunk)
         note = self.config.translation_note.strip()
         language_note = _build_target_language_note(self.config.target_language)
-        reasoning_note = _build_reasoning_note(self.config.reasoning_level)
-        extra_notes = "\n".join(part for part in (language_note, note, reasoning_note) if part).strip()
+        extra_notes = "\n".join(part for part in (language_note, note) if part).strip()
         system_prompt = self.config.system_prompt.replace("{{note}}", extra_notes)
 
         exhausted_waits = 0
@@ -333,54 +345,66 @@ class GeminiTranslator:
         return True
 
     def _request_translation(self, api_key: str, model_name: str, system_prompt: str, user_prompt: str) -> str:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=system_prompt,
-            generation_config={
-                "temperature": self.config.temperature,
-                "top_p": self.config.top_p,
-                "candidate_count": 1,
-                "response_mime_type": "text/plain",
-            },
-            safety_settings={
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            },
-        )
-        try:
-            response = model.generate_content(user_prompt, request_options={"timeout": 1200})
-        except Exception as exc:
-            message = str(exc) or exc.__class__.__name__
-            if _is_quota_error(message):
-                raise QuotaExceededError(message) from exc
-            if _is_safety_error(message):
-                raise SafetyBlockedError(message) from exc
-            if _is_transient_error(message):
-                raise TransientServiceError(message) from exc
-            raise TranslationError(message) from exc
+        client = self._clients.get(api_key)
+        if client is None:
+            client = genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(timeout=REQUEST_TIMEOUT_MS))
+            self._clients[api_key] = client
+
+        while True:
+            thinking_level = self._thinking_level_for(model_name)
+            config = genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=self.config.temperature,
+                top_p=self.config.top_p,
+                candidate_count=1,
+                response_mime_type="text/plain",
+                safety_settings=_SAFETY_SETTINGS,
+                thinking_config=(
+                    genai_types.ThinkingConfig(thinking_level=thinking_level.upper()) if thinking_level else None
+                ),
+            )
+            try:
+                response = client.models.generate_content(model=model_name, contents=user_prompt, config=config)
+                break
+            except genai_errors.APIError as exc:
+                message = str(exc) or exc.__class__.__name__
+                if exc.code == 400 and thinking_level and "thinking" in message.lower():
+                    self._downgrade_thinking_level(model_name, thinking_level, message)
+                    continue
+                raise _classify_api_error(message, exc.code) from exc
+            except httpx.TransportError as exc:
+                raise TransientServiceError(str(exc) or exc.__class__.__name__) from exc
+            except Exception as exc:
+                raise _classify_api_error(str(exc) or exc.__class__.__name__, None) from exc
+
         self._log_token_usage(model_name, response)
-
-        finish_reason = ""
-        candidates = getattr(response, "candidates", None) or []
-        if candidates:
-            finish_reason = str(getattr(candidates[0], "finish_reason", ""))
-            if "SAFETY" in finish_reason.upper():
-                raise SafetyBlockedError(f"finish_reason={finish_reason}")
-
-        try:
-            text = response.text
-        except Exception as exc:
-            message = str(exc)
-            if _is_safety_error(message) or "SAFETY" in finish_reason.upper():
-                raise SafetyBlockedError(message or finish_reason) from exc
-            raise ResponseFormatError(message or f"Failed to read response text (finish_reason={finish_reason}).") from exc
-
+        feedback = getattr(response, "prompt_feedback", None)
+        if feedback is not None and feedback.block_reason:
+            raise SafetyBlockedError(f"prompt blocked: {_enum_name(feedback.block_reason)}")
+        candidates = response.candidates or []
+        finish_reason = _enum_name(candidates[0].finish_reason) if candidates else ""
+        if finish_reason in _BLOCKED_FINISH_REASONS:
+            raise SafetyBlockedError(f"finish_reason={finish_reason}")
+        text = response.text or ""
         if not text.strip():
-            raise ResponseFormatError("Received an empty response.")
+            raise ResponseFormatError(f"Received an empty response (finish_reason={finish_reason or 'none'}).")
         return text
+
+    def _thinking_level_for(self, model_name: str) -> str | None:
+        if model_name in self._thinking_levels:
+            return self._thinking_levels[model_name]
+        level = self.config.reasoning_level.strip().lower()
+        return level if level in THINKING_LEVELS else None
+
+    def _downgrade_thinking_level(self, model_name: str, rejected_level: str, message: str) -> None:
+        # 모델마다 허용하는 thinking 수준이 달라서(예: 3.7/3.8 Flash는 minimal 불가) 거절되면 한 단계 올리고,
+        # 끝까지 안 되면 thinking 설정 없이 보낸다. 결과는 모델별로 기억한다.
+        position = THINKING_LEVELS.index(rejected_level)
+        next_level = THINKING_LEVELS[position + 1] if position + 1 < len(THINKING_LEVELS) else None
+        self._thinking_levels[model_name] = next_level
+        self.log_callback(
+            f"Model {model_name} rejected thinking level '{rejected_level}' -> using '{next_level or 'model default'}' ({message[:120]})"
+        )
 
     def _log_token_usage(self, model_name: str, response) -> None:
         usage = getattr(response, "usage_metadata", None)
@@ -495,11 +519,6 @@ def _is_model_unavailable_error(message: str) -> bool:
     return "404" in lowered or "not found" in lowered or "not supported for generatecontent" in lowered
 
 
-def _is_safety_error(message: str) -> bool:
-    lowered = message.lower()
-    return any(token in lowered for token in ("safety", "blocked", "block_reason", "prohibited", "recitation"))
-
-
 def _normalize_for_echo(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", html.unescape(text)).casefold()
     return "".join(char for char in normalized if unicodedata.category(char)[0] in {"L", "N"})
@@ -531,14 +550,15 @@ def _build_target_language_note(target_language: str) -> str:
     )
 
 
-def _build_reasoning_note(reasoning_level: str) -> str:
-    normalized = reasoning_level.strip().lower()
-    if normalized == "minimal":
-        return "Reasoning level: minimal. Prioritize structure preservation and direct output."
-    if normalized == "low":
-        return "Reasoning level: low. Preserve structure and output only the translation result."
-    if normalized == "medium":
-        return "Reasoning level: medium. Improve translation quality while keeping structure exact."
-    if normalized == "high":
-        return "Reasoning level: high. Maximize translation quality but preserve structure exactly."
-    return ""
+def _enum_name(value) -> str:
+    return str(getattr(value, "name", None) or value or "").split(".")[-1].upper()
+
+
+def _classify_api_error(message: str, code: int | None) -> TranslationError:
+    if code == 429 or _is_quota_error(message):
+        return QuotaExceededError(message)
+    if code in {401, 403} or _is_auth_error(message):
+        return TranslationError(message)
+    if (code is not None and code >= 500) or _is_transient_error(message):
+        return TransientServiceError(message)
+    return TranslationError(message)
