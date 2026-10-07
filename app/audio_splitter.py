@@ -346,7 +346,8 @@ def _split_lossless_flac(path, info, titles, cut_points, output_paths, created, 
         audio = source.streams.audio[0]
         cover_stream, cover_bytes, base_metadata = _segment_extras(path, source, info)
         rate = info.sample_rate
-        bits = int(audio.codec_context.bits_per_raw_sample or 0)
+        # PyAV 18 이하는 이 속성이 없다. 그때는 FFmpeg flac 인코더 기본값(32비트 샘플 → 24비트 기록)을 따른다.
+        bits = int(getattr(audio.codec_context, "bits_per_raw_sample", 0) or 0)
         boundaries = [int(round(point * rate)) for point in cut_points]
         results: list[SplitResult] = []
         segment_index = -1
@@ -516,7 +517,7 @@ def _open_segment_output(
             source_context = audio_stream.codec_context
             out_audio = output.add_stream("flac", rate=info.sample_rate, layout=source_context.layout.name)
             out_audio.format = source_context.format.name
-            if encode_bits:
+            if encode_bits and hasattr(out_audio.codec_context, "bits_per_raw_sample"):
                 out_audio.codec_context.bits_per_raw_sample = encode_bits
         out_audio.metadata.update(audio_stream.metadata)
         out_cover = None
