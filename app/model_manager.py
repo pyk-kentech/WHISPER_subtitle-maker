@@ -102,9 +102,14 @@ def get_model_dir(model_key: str = DEFAULT_MODEL_KEY) -> Path:
     return get_model_cache_dir_for(model_key)
 
 
+def get_required_files(model_key: str = DEFAULT_MODEL_KEY) -> tuple[str, ...]:
+    preset = MODEL_PRESETS.get(model_key, MODEL_PRESETS[DEFAULT_MODEL_KEY])
+    return tuple(preset.get("files", MODEL_REQUIRED_FILES))
+
+
 def is_model_ready(model_dir: Path | None = None, model_key: str = DEFAULT_MODEL_KEY) -> bool:
     target_dir = model_dir or get_model_dir(model_key)
-    return all((target_dir / filename).is_file() for filename in MODEL_REQUIRED_FILES)
+    return all((target_dir / filename).is_file() for filename in get_required_files(model_key))
 
 
 def get_download_plan(model_key: str = DEFAULT_MODEL_KEY) -> DownloadPlan:
@@ -116,7 +121,7 @@ def get_download_plan(model_key: str = DEFAULT_MODEL_KEY) -> DownloadPlan:
 
     files: list[DryRunFileInfo] = []
     total_bytes = 0
-    for filename in MODEL_REQUIRED_FILES:
+    for filename in get_required_files(model_key):
         info = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
@@ -136,7 +141,7 @@ def download_model(model_key: str, progress_callback: ProgressCallback, status_c
     cache_dir = get_hf_cache_dir()
     repo_id = get_model_repo_id(model_key)
 
-    if plan.total_bytes == 0 and is_model_ready(model_dir):
+    if plan.total_bytes == 0 and is_model_ready(model_dir, model_key):
         progress_callback(1, 1, "", 1, 1)
         status_callback("모델 캐시가 이미 준비되어 있습니다.")
         return model_dir
@@ -161,7 +166,7 @@ def download_model(model_key: str, progress_callback: ProgressCallback, status_c
     finally:
         HubProgressTqdm.reporter = None
 
-    if not is_model_ready(model_dir):
+    if not is_model_ready(model_dir, model_key):
         raise RuntimeError("모델 다운로드 후에 필수 파일이 누락되어 있습니다.")
 
     status_callback("모델 다운로드 완료")

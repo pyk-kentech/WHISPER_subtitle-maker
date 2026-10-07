@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from datetime import datetime
+import dataclasses
 import logging
 import subprocess
 
@@ -391,6 +392,7 @@ class MainWindow(QMainWindow):
         self._split_source: Path | None = None
         self._split_duration: float | None = None
         self._split_output_dir: Path | None = None
+        self._pending_shutdown_label: str | None = None
 
         self._translator_settings = load_translator_settings()
         self._saved_api_keys_text = "\n".join(load_api_keys())
@@ -886,6 +888,7 @@ class MainWindow(QMainWindow):
         self._split_worker.finished_success.connect(self.on_audio_split_finished)
         self._split_worker.failed.connect(self.on_audio_split_failed)
         self._split_worker.finished.connect(self._refresh_split_controls)
+        self._split_worker.finished.connect(self._run_pending_shutdown)
         self.split_progress.setValue(0)
         self.split_log_view.append(f"분할 시작: {self._split_source.name} -> {count}개 구간")
         self._split_worker.start()
@@ -1319,15 +1322,27 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         super().closeEvent(event)
+        if event.isAccepted():
+            # 트레이가 없으면 창을 닫는 것이 곧 종료다(QuitOnLastWindowClosed가 꺼져 있어 직접 끝낸다).
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
 
     def is_busy(self) -> bool:
         return (
             (self._download_worker is not None and self._download_worker.isRunning())
             or (self._pipeline_worker is not None and self._pipeline_worker.isRunning())
             or (self._subtitle_translation_worker is not None and self._subtitle_translation_worker.isRunning())
+            or (self._split_worker is not None and self._split_worker.isRunning())
         )
 
     def _stop_workers_for_exit(self) -> None:
+        if self._split_worker is not None and self._split_worker.isRunning():
+            # 분할 작업은 취소 요청을 확인하고 만들던 파일을 지운 뒤 스스로 끝난다.
+            self._split_worker.requestInterruption()
+            if not self._split_worker.wait(10000):
+                self._split_worker.terminate()
+                self._split_worker.wait(2000)
         for worker in (self._download_worker, self._pipeline_worker, self._subtitle_translation_worker):
             if worker is None or not worker.isRunning():
                 continue
@@ -1432,6 +1447,11 @@ class MainWindow(QMainWindow):
 
     def translator_settings(self) -> TranslatorSettings:
         return self._translator_settings
+
+    def _job_translator_settings(self) -> TranslatorSettings:
+        # 출력 언어는 작업 설정 메뉴에서 바로 바꿀 수 있으므로, 저장 여부와 관계없이 현재 선택값을 쓴다.
+        target = str(self.output_language_combo.currentData() or self._translator_settings.target_language)
+        return dataclasses.replace(self._translator_settings, target_language=target)
 
     def mark_translation_inputs_dirty(self) -> None:
         self._settings_dirty = True
@@ -1825,7 +1845,7 @@ class MainWindow(QMainWindow):
         job = SubtitleTranslationJob(
             source_paths=source_paths,
             source_language=self.current_input_language(),
-            translator_settings=self.translator_settings(),
+            translator_settings=self._job_translator_settings(),
             api_keys=api_keys,
             deepl_api_key=deepl_api_key,
         )
@@ -1838,6 +1858,7 @@ class MainWindow(QMainWindow):
         self._subtitle_translation_worker.translation_progress_changed.connect(self.on_subtitle_translation_progress_changed)
         self._subtitle_translation_worker.summary_ready.connect(self.on_subtitle_summary_ready)
         self._subtitle_translation_worker.failed.connect(self.on_subtitle_failed)
+        self._subtitle_translation_worker.finished.connect(self._run_pending_shutdown)
         self._subtitle_translation_worker.start()
         self.update_controls()
         self.subtitle_log_view.append(
@@ -2016,7 +2037,7 @@ class MainWindow(QMainWindow):
             vad_settings=self.current_vad_settings(),
             enable_postprocess=self.postprocess_checkbox.isChecked(),
             enable_enhanced_postprocess=self.enhanced_postprocess_checkbox.isChecked(),
-            translator_settings=self.translator_settings(),
+            translator_settings=self._job_translator_settings(),
             api_keys=api_keys,
             deepl_api_key=deepl_api_key,
             enable_translation=enable_translation,
@@ -2032,6 +2053,7 @@ class MainWindow(QMainWindow):
         self._pipeline_worker.processing_state_changed.connect(self.on_processing_state_changed)
         self._pipeline_worker.summary_ready.connect(self.on_pipeline_summary_ready)
         self._pipeline_worker.failed.connect(self.on_pipeline_failed)
+        self._pipeline_worker.finished.connect(self._run_pending_shutdown)
         self._pipeline_worker.start()
         self.update_controls()
         self.log(
@@ -2134,7 +2156,7 @@ class MainWindow(QMainWindow):
             f"작업 완료\n성공: {self._session_success_count}\n실패: {self._session_failure_count}\n스킵: {self._session_skipped_count}"
         )
         self.log(summary.replace("\n", " | "))
-        self._schedule_shutdown_after_completion("메인 작업")
+        self._request_shutdown_after_completion("메인 작업")
         QMessageBox.information(self, APP_NAME, summary)
 
     def on_pipeline_failed(self, message: str) -> None:
@@ -2166,7 +2188,7 @@ class MainWindow(QMainWindow):
             f"자막 번역 완료\n성공: {self._subtitle_success_count}\n실패: {self._subtitle_failure_count}\n스킵: {self._subtitle_skipped_count}"
         )
         self.subtitle_log_view.append(summary.replace("\n", " | "))
-        self._schedule_shutdown_after_completion("자막 번역 작업")
+        self._request_shutdown_after_completion("자막 번역 작업")
         QMessageBox.information(self, APP_NAME, summary)
 
     def on_subtitle_failed(self, message: str) -> None:
@@ -2177,6 +2199,22 @@ class MainWindow(QMainWindow):
         self.subtitle_log_view.append(f"작업 실패: {message}")
         self.update_controls()
         QMessageBox.warning(self, APP_NAME, message)
+
+    def _request_shutdown_after_completion(self, job_label: str) -> None:
+        if not self.shutdown_after_complete_checkbox.isChecked() or self._shutdown_scheduled:
+            return
+        self._pending_shutdown_label = job_label
+        self._run_pending_shutdown()
+
+    def _run_pending_shutdown(self) -> None:
+        # 다른 작업(자막 번역·음성 분할·모델 다운로드)이 남아 있으면 모두 끝난 뒤에 예약한다.
+        label = self._pending_shutdown_label
+        if label is None or self.is_busy():
+            if label is not None:
+                self.log(f"{label} 완료: 진행 중인 다른 작업이 끝나면 자동 종료를 예약합니다.")
+            return
+        self._pending_shutdown_label = None
+        self._schedule_shutdown_after_completion(label)
 
     def _schedule_shutdown_after_completion(self, job_label: str) -> None:
         if not self.shutdown_after_complete_checkbox.isChecked() or self._shutdown_scheduled:

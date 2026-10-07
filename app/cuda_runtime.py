@@ -227,7 +227,7 @@ def ensure_cuda_runtime(
             progress_callback(1, 1, filename, 1, 1)
             status_callback(f"CUDA 런타임 캐시 사용: {filename}")
 
-        if installed_versions.get(package_name) != version:
+        if installed_versions.get(package_name) != version or not is_cuda_runtime_ready():
             status_callback(f"CUDA 런타임 설치 중: {package_name} {version}")
             _extract_dlls(wheel_path, status_callback)
 

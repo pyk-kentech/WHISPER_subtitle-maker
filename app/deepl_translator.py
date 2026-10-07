@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import time
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ DEEPL_TARGET_LANGUAGE_MAP = {
 
 MAX_TEXTS_PER_REQUEST = 50
 MAX_REQUEST_BODY_BYTES = 120 * 1024
+RETRY_WAIT_SECONDS = (5.0, 15.0, 30.0)
 
 
 class DeepLAuthError(TranslationError):
@@ -35,6 +37,10 @@ class DeepLAuthError(TranslationError):
 
 
 class DeepLQuotaExceededError(TranslationError):
+    pass
+
+
+class DeepLRetryableError(TranslationError):
     pass
 
 
@@ -64,16 +70,35 @@ class DeepLTranslator:
         on_chunk_progress: Callable[[int, int, str, str, int], None],
         file_name: str,
     ) -> dict[str, str]:
+        """실패하면 그때까지 번역된 줄을 예외의 partial에 담아 던진다."""
         chunks = self._build_chunks(records)
         translated: dict[str, str] = {}
         for chunk_index, chunk in enumerate(chunks, start=1):
             self.log_callback(f"[{file_name}] chunk {chunk_index}/{len(chunks)} | provider=deepl-free-api")
-            self._sleep_for_request_spacing()
-            chunk_result = self._translate_chunk(chunk)
-            self._last_request_monotonic = time.monotonic()
+            try:
+                chunk_result = self._translate_chunk_with_retry(chunk, file_name)
+            except TranslationError as exc:
+                exc.partial = translated
+                raise
             translated.update(chunk_result)
             on_chunk_progress(chunk_index, len(chunks), self.current_key_display, "deepl-free-api", self.error_count)
         return translated
+
+    def _translate_chunk_with_retry(self, chunk, file_name: str) -> dict[str, str]:
+        for attempt in range(len(RETRY_WAIT_SECONDS) + 1):
+            self._sleep_for_request_spacing()
+            try:
+                return self._translate_chunk(chunk)
+            except DeepLRetryableError as exc:
+                self.error_count += 1
+                if attempt >= len(RETRY_WAIT_SECONDS):
+                    raise
+                wait = RETRY_WAIT_SECONDS[attempt]
+                self.log_callback(f"[{file_name}] DeepL 일시 오류, {wait:.0f}초 후 다시 시도합니다: {exc}")
+                time.sleep(wait)
+            finally:
+                self._last_request_monotonic = time.monotonic()
+        raise TranslationError("DeepL request failed.")
 
     def _build_chunks(self, records) -> list[list]:
         chunks: list[list] = []
@@ -144,11 +169,16 @@ class DeepLTranslator:
             message = exc.read().decode("utf-8", errors="replace")
             if exc.code in {401, 403}:
                 raise DeepLAuthError(message or f"DeepL authentication failed with HTTP {exc.code}.") from exc
-            if exc.code in {429, 456}:
-                raise DeepLQuotaExceededError(message or f"DeepL quota exceeded with HTTP {exc.code}.") from exc
+            if exc.code == 456:
+                raise DeepLQuotaExceededError(message or "DeepL monthly quota exceeded (HTTP 456).") from exc
+            if exc.code == 429 or exc.code >= 500:
+                raise DeepLRetryableError(message or f"DeepL request failed with HTTP {exc.code}.") from exc
             raise TranslationError(message or f"DeepL request failed with HTTP {exc.code}.") from exc
         except error.URLError as exc:
-            raise TranslationError(str(exc.reason) or "DeepL request failed.") from exc
+            raise DeepLRetryableError(str(exc.reason) or "DeepL request failed.") from exc
+        except (http.client.HTTPException, OSError) as exc:
+            # 응답을 읽는 중 끊김·타임아웃은 urllib가 URLError로 감싸지 않는다.
+            raise DeepLRetryableError(str(exc) or exc.__class__.__name__) from exc
 
         try:
             data = json.loads(raw.decode("utf-8"))

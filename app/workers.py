@@ -8,7 +8,16 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from .audio_splitter import build_cut_points, find_quiet_cut_points, format_timestamp, probe_audio, split_audio
+from .config import INPUT_LANGUAGE_OPTIONS
+from .audio_splitter import (
+    AudioSplitCancelled,
+    build_cut_points,
+    find_quiet_cut_points,
+    format_timestamp,
+    measure_audio_duration,
+    probe_audio,
+    split_audio,
+)
 from .cuda_runtime import ensure_cuda_runtime
 from .deepl_translator import DeepLConfig, DeepLTranslator
 from .dictionary_pack import ensure_dictionary_pack
@@ -150,7 +159,7 @@ def translate_records(records, gemini_translator, deepl_translator, progress_cal
     if gemini_translator is not None:
         try:
             translations = gemini_translator.translate_lines(records, progress_callback, file_name)
-        except TranslationError as exc:
+        except Exception as exc:
             translations = dict(getattr(exc, "partial", None) or {})
             gemini_aborted = True
             log_callback(f"{file_name} | Gemini 번역 중단 -> {str(exc) or exc.__class__.__name__}")
@@ -160,7 +169,8 @@ def translate_records(records, gemini_translator, deepl_translator, progress_cal
         log_callback(f"{file_name} | 번역되지 않은 {len(missing)}줄을 DeepL Free API로 번역합니다.")
         try:
             translations.update(deepl_translator.translate_lines(missing, progress_callback, file_name))
-        except TranslationError as exc:
+        except Exception as exc:
+            translations.update(getattr(exc, "partial", None) or {})
             log_callback(f"{file_name} | DeepL 번역 실패 -> {str(exc) or exc.__class__.__name__}")
         missing = [record for record in records if record.line_id not in translations]
 
@@ -423,13 +433,24 @@ class PipelineWorker(QThread):
                     if not subtitle_text.strip():
                         raise RuntimeError("자막 생성 결과가 비어 있습니다.")
 
-                    if gemini_translator is None:
+                    if not self.job.enable_translation:
                         self.item_status_changed.emit(source_str, STATUS_SAVING, str(output_path))
                         self._enqueue_save(SaveTask(source_path=source_str, output_path=output_path, content=subtitle_text))
                         self.log_message.emit(f"{source_path} | 번역 없이 저장 큐 등록 -> {output_path}")
                         self.stage_changed.emit("저장", "자막 저장 큐 등록")
                         self.stage_progress_changed.emit(100, 0.0, 0.0)
                         continue
+
+                    if existing_original is None and not original_output_path.exists():
+                        # 번역 도중 예기치 못한 오류가 나도 음성 인식 결과는 남도록 먼저 저장한다.
+                        self._enqueue_save(
+                            SaveTask(
+                                source_path=source_str,
+                                output_path=original_output_path,
+                                content=subtitle_text,
+                                is_primary=False,
+                            )
+                        )
 
                     self.item_status_changed.emit(source_str, STATUS_TRANSLATING, "")
                     self.stage_changed.emit("번역", "자막 번역")
@@ -444,16 +465,6 @@ class PipelineWorker(QThread):
                         self.log_message.emit,
                     )
                     self._pause_checkpoint("현재 파일 일시 중지됨")
-
-                    if existing_original is None and not original_output_path.exists():
-                        self._enqueue_save(
-                            SaveTask(
-                                source_path=source_str,
-                                output_path=original_output_path,
-                                content=subtitle_text,
-                                is_primary=False,
-                            )
-                        )
 
                     if outcome.failed:
                         raise TranslationError(
@@ -507,11 +518,13 @@ class PipelineWorker(QThread):
             self.failed.emit(str(exc) or exc.__class__.__name__)
 
     def _find_existing_original(self, output_path: Path) -> tuple[Path, str] | None:
-        candidates: list[tuple[Path, str]] = []
         if self.job.source_language != "auto":
-            candidates.append(
-                (build_translated_subtitle_output_path(output_path, self.job.source_language), self.job.source_language)
-            )
+            languages = [self.job.source_language]
+        else:
+            # 자동 감지면 번역 대상 언어를 뺀 입력 언어 후보를 모두 확인한다(번역 결과 파일과 혼동 방지).
+            target = self.job.translator_settings.target_language
+            languages = [code for code, _label in INPUT_LANGUAGE_OPTIONS if code not in {"auto", target}]
+        candidates = [(build_translated_subtitle_output_path(output_path, code), code) for code in languages]
         candidates.append((build_translated_subtitle_output_path(output_path, "jp"), "ja"))
         for path, language in candidates:
             if path.is_file():
@@ -740,6 +753,14 @@ class SubtitleTranslationWorker(QThread):
                 try:
                     if not source_path.exists():
                         raise FileNotFoundError("입력 자막 파일을 찾을 수 없습니다.")
+                    target = self.job.translator_settings.target_language.strip().lower()
+                    if target and source_path.stem.lower().endswith(f".{target}"):
+                        self._skipped_count += 1
+                        message = "이미 번역된 자막 파일로 보여 스킵 (파일 이름이 출력 언어 코드로 끝남)"
+                        self.item_status_changed.emit(source_str, STATUS_SKIPPED, message)
+                        self.log_message.emit(f"{source_path} | {message}")
+                        self.stage_changed.emit("스킵", "번역 결과 파일")
+                        continue
                     if output_path.exists():
                         self._skipped_count += 1
                         message = "기존 번역 자막 파일 존재 -> 스킵"
@@ -806,6 +827,14 @@ class AudioSplitWorker(QThread):
     def run(self) -> None:
         try:
             info = probe_audio(self.job.source_path)
+            actual = measure_audio_duration(self.job.source_path, self.isInterruptionRequested)
+            if actual > 0 and abs(actual - info.duration) > 0.5:
+                self.log_message.emit(
+                    f"파일에 기록된 길이({format_timestamp(info.duration, True)})와 실제 오디오 길이"
+                    f"({format_timestamp(actual, True)})가 달라 실제 길이를 기준으로 나눕니다."
+                )
+            if actual > 0:
+                info.duration = actual
             cut_points = build_cut_points(self.job.end_times, info.duration)
             search = self.job.silence_search_seconds
             if search > 0:
@@ -816,6 +845,7 @@ class AudioSplitWorker(QThread):
                     info.duration,
                     search,
                     lambda ratio: self.progress_changed.emit(int(ratio * 30)),
+                    self.isInterruptionRequested,
                 )
                 for index, (original, (point, before, after)) in enumerate(zip(cut_points, snapped), start=1):
                     shift = point - original
@@ -835,6 +865,7 @@ class AudioSplitWorker(QThread):
                 cut_points,
                 self.job.output_dir,
                 lambda ratio: self.progress_changed.emit(30 + int(ratio * 70)),
+                self.isInterruptionRequested,
             )
             for result in results:
                 self.log_message.emit(
@@ -842,5 +873,7 @@ class AudioSplitWorker(QThread):
                 )
             self.progress_changed.emit(100)
             self.finished_success.emit([str(result.path) for result in results])
+        except AudioSplitCancelled:
+            self.log_message.emit("분할을 취소했습니다. 만들던 파일은 지웠습니다.")
         except Exception as exc:
             self.failed.emit(str(exc) or exc.__class__.__name__)

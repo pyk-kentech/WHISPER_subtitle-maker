@@ -46,6 +46,7 @@ def _parse_srt(lines: list[str]) -> list[LineRecord]:
     active_text = False
     cue_index = 0
     text_index = 0
+    numbered = False
 
     for position, raw_line in enumerate(lines):
         stripped = raw_line.strip()
@@ -57,11 +58,16 @@ def _parse_srt(lines: list[str]) -> list[LineRecord]:
         next_is_timing = position + 1 < len(lines) and "-->" in lines[position + 1]
         if stripped.isdigit() and (not active_text or next_is_timing):
             cue_index += 1
+            numbered = True
             records.append(LineRecord(text=raw_line, translatable=False))
             active_text = False
             text_index = 0
             continue
         if "-->" in raw_line:
+            if not numbered:
+                # 번호 줄이 없는 SRT도 큐마다 다른 ID를 갖도록 시간 줄에서 센다.
+                cue_index += 1
+            numbered = False
             records.append(LineRecord(text=raw_line, translatable=False))
             active_text = True
             text_index = 0

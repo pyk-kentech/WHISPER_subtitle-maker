@@ -114,14 +114,14 @@ class GeminiTranslator:
         self._records: list = []
         self._record_positions: dict[str, int] = {}
         self._unavailable_models: set[str] = set()
+        self._daily_exhausted_models: set[str] = set()
         self._quota_exhausted = False
         self.token_usage = {"prompt": 0, "output": 0, "thinking": 0}
         self._clients: dict[str, genai.Client] = {}
         self._thinking_levels: dict[str, str | None] = {}
-        self._adaptive_delay_seconds = max(
-            self.config.min_adaptive_delay_seconds,
-            float(self.config.request_delay_seconds),
-        )
+        # 사용자가 정한 요청 간격은 최소값으로 지킨다(무료 티어 분당 한도 보호).
+        self._base_delay_seconds = max(self.config.min_adaptive_delay_seconds, float(self.config.request_delay_seconds))
+        self._adaptive_delay_seconds = self._base_delay_seconds
 
     @property
     def current_key_display(self) -> str:
@@ -150,7 +150,7 @@ class GeminiTranslator:
             try:
                 translated.update(self._translate_chunk_with_split(chunk, file_name, chunk_index, len(chunks)))
             except TranslationUnavailableError as exc:
-                exc.partial = translated
+                _carry_partial(exc, translated)
                 raise
             candidates = self._resolve_model_candidates()
             on_chunk_progress(
@@ -195,9 +195,13 @@ class GeminiTranslator:
             f"[{file_name}] chunk {chunk_index}/{chunk_total} | {len(retry_chunk)}/{len(chunk)} lines misaligned "
             f"(first: {retry_chunk[0].line_id}) -> retrying those lines"
         )
-        translated.update(
-            self._translate_chunk_with_split(retry_chunk, file_name, chunk_index, chunk_total, split_depth + 1)
-        )
+        try:
+            translated.update(
+                self._translate_chunk_with_split(retry_chunk, file_name, chunk_index, chunk_total, split_depth + 1)
+            )
+        except TranslationUnavailableError as exc:
+            _carry_partial(exc, translated)
+            raise
         return translated
 
     def _split_failed_chunk(
@@ -229,12 +233,16 @@ class GeminiTranslator:
             f"[{file_name}] chunk {chunk_index}/{chunk_total} | splitting failed chunk depth={split_depth + 1} size={len(chunk)} -> {len(left_chunk)} + {len(right_chunk)} ({reason})"
         )
         translated: dict[str, str] = {}
-        translated.update(
-            self._translate_chunk_with_split(left_chunk, file_name, chunk_index, chunk_total, split_depth + 1)
-        )
-        translated.update(
-            self._translate_chunk_with_split(right_chunk, file_name, chunk_index, chunk_total, split_depth + 1)
-        )
+        try:
+            translated.update(
+                self._translate_chunk_with_split(left_chunk, file_name, chunk_index, chunk_total, split_depth + 1)
+            )
+            translated.update(
+                self._translate_chunk_with_split(right_chunk, file_name, chunk_index, chunk_total, split_depth + 1)
+            )
+        except TranslationUnavailableError as exc:
+            _carry_partial(exc, translated)
+            raise
         return translated
 
     def _build_user_prompt(self, chunk) -> str:
@@ -263,11 +271,17 @@ class GeminiTranslator:
             quota_failures = 0
             attempts = 0
             last_error = ""
-            for model_name in self._resolve_model_candidates():
+            start_key_index = self._key_index
+            candidates = self._resolve_model_candidates()
+            if not candidates and self._daily_exhausted_models:
+                self._quota_exhausted = True
+                raise TranslationUnavailableError("모든 Gemini 모델의 오늘 무료 한도가 소진되었습니다.")
+            for model_name in candidates:
+                model_quota_failures = 0
                 for offset in range(len(self.config.keys)):
                     if attempts >= self.config.max_retry_per_chunk:
                         break
-                    key_index = (self._key_index + offset) % len(self.config.keys)
+                    key_index = (start_key_index + offset) % len(self.config.keys)
                     api_key = self.config.keys[key_index]
                     self._key_index = key_index
                     self.log_callback(
@@ -298,7 +312,14 @@ class GeminiTranslator:
                         retryable_failures += 1
                         if isinstance(exc, QuotaExceededError):
                             quota_failures += 1
-                            self._on_quota_error()
+                            model_quota_failures += 1
+                            if _is_daily_quota_error(str(exc)) and model_quota_failures >= len(self.config.keys):
+                                # 하루 한도는 기다려도 풀리지 않으므로 이번 작업에서는 이 모델을 건너뛴다.
+                                self._daily_exhausted_models.add(model_name)
+                                self._unavailable_models.add(model_name)
+                                self.log_callback(f"Model {model_name} reached its daily quota on every key; skipping it from now on.")
+                            else:
+                                self._on_quota_error()
                         last_error = str(exc)
                         self.log_callback(f"Rate limited or temporarily unavailable, switching key: {exc}")
                         continue
@@ -320,6 +341,8 @@ class GeminiTranslator:
 
             if content_failures:
                 raise TranslationError(f"Gemini could not translate this chunk: {last_error}")
+            if retryable_failures and not self._resolve_model_candidates():
+                continue
             if retryable_failures:
                 if exhausted_waits >= self.config.max_exhausted_waits:
                     if quota_failures:
@@ -463,7 +486,7 @@ class GeminiTranslator:
         return [item for item in candidates if item not in self._unavailable_models]
 
     def _sleep_for_request_spacing(self) -> None:
-        base_delay = max(self.config.min_adaptive_delay_seconds, self._adaptive_delay_seconds)
+        base_delay = max(self._base_delay_seconds, self._adaptive_delay_seconds)
         if base_delay <= 0:
             return
         jitter = random.uniform(0.0, DEFAULT_TRANSLATION_REQUEST_DELAY_JITTER_SECONDS)
@@ -481,21 +504,21 @@ class GeminiTranslator:
             time.sleep(remaining)
 
     def _on_request_success(self) -> None:
-        self._adaptive_delay_seconds = max(
-            self.config.min_adaptive_delay_seconds,
-            self._adaptive_delay_seconds - 0.2,
-        )
+        self._adaptive_delay_seconds = max(self._base_delay_seconds, self._adaptive_delay_seconds - 0.2)
 
     def _on_quota_error(self) -> None:
-        self._adaptive_delay_seconds = min(
-            self.config.max_adaptive_delay_seconds,
-            self._adaptive_delay_seconds + 2.0,
-        )
+        ceiling = max(self.config.max_adaptive_delay_seconds, self._base_delay_seconds)
+        self._adaptive_delay_seconds = min(ceiling, self._adaptive_delay_seconds + 2.0)
 
 
 def _is_quota_error(message: str) -> bool:
     lowered = message.lower()
     return any(token in lowered for token in ("429", "quota", "resource_exhausted", "rate limit", "too many requests"))
+
+
+def _is_daily_quota_error(message: str) -> bool:
+    lowered = message.lower()
+    return "perday" in lowered or "per day" in lowered or "daily" in lowered
 
 
 def _is_transient_error(message: str) -> bool:
@@ -548,6 +571,12 @@ def _build_target_language_note(target_language: str) -> str:
         "when a sentence continues across lines.\n"
         'Lines inside <main id="context"> are earlier dialogue for reference only. Do not translate or output them.'
     )
+
+
+def _carry_partial(exc: TranslationUnavailableError, translated: dict[str, str]) -> None:
+    """중단 예외에 지금까지 번역된 줄을 모아 둔다(안쪽 재시도·분할에서 얻은 결과 포함)."""
+    partial = getattr(exc, "partial", None) or {}
+    exc.partial = {**translated, **partial}
 
 
 def _enum_name(value) -> str:

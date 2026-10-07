@@ -30,15 +30,18 @@ MODEL_PRESETS = {
     "large-v3": {
         "label": "faster-whisper-XXL-large-v3",
         "repo_id": "Systran/faster-whisper-large-v3",
+        "files": ("config.json", "model.bin", "tokenizer.json", "vocabulary.json", "preprocessor_config.json"),
     },
     "large-v3-turbo": {
         "label": "faster-whisper-XXL-large-v3-turbo",
-        "repo_id": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+        "repo_id": "dropbox-dash/faster-whisper-large-v3-turbo",
+        "files": ("config.json", "model.bin", "tokenizer.json", "vocabulary.json", "preprocessor_config.json"),
     },
 }
 DEFAULT_MODEL_KEY = "medium"
 MODEL_LABEL = MODEL_PRESETS[DEFAULT_MODEL_KEY]["label"]
 SUPPORTED_EXTENSIONS = {".mp3", ".mp4"}
+# large-v3 계열은 vocabulary.json + preprocessor_config.json(128 mel)을 쓰므로 프리셋의 "files"가 우선한다.
 MODEL_REQUIRED_FILES = (
     "config.json",
     "model.bin",

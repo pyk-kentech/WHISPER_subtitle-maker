@@ -32,6 +32,7 @@ _SPACE_AFTER_JP_PUNCT = re.compile(rf"(?<=[{JP_COMMA}{JP_PERIOD}{JP_EXCL}{JP_QUE
 _ENDS_WITH_JP_CHAR = re.compile(rf"[{_JAPANESE_CHAR}]$")
 _STARTS_WITH_JP_CHAR = re.compile(rf"^[{_JAPANESE_CHAR}]")
 _NFKC_TRIGGER = re.compile(r"[\uff00-\uffef\u3000]")
+_ASCII_COMMA_NOT_IN_NUMBER = re.compile(r"(?<!\d),|,(?!\d)")
 _TOKENIZER_CACHE: dict[str, sudachi_tokenizer.Tokenizer] = {}
 
 _CONTINUATION_ENDINGS = (
@@ -113,7 +114,8 @@ class PostprocessOptions:
 def _normalize_punctuation(text: str) -> str:
     normalized = text
     normalized = normalized.replace("\uff64", JP_COMMA).replace("\uff61", JP_PERIOD)
-    normalized = normalized.replace("\uff0c", JP_COMMA).replace(",", JP_COMMA)
+    normalized = normalized.replace("\uff0c", JP_COMMA)
+    normalized = _ASCII_COMMA_NOT_IN_NUMBER.sub(JP_COMMA, normalized)
     normalized = normalized.replace("\uff0e", JP_PERIOD)
     normalized = _JP_DOT_BETWEEN.sub(JP_PERIOD, normalized)
     normalized = _JP_DOT_BEFORE_END.sub(JP_PERIOD, normalized)
@@ -177,9 +179,7 @@ def postprocess_japanese_text(text: str, options: PostprocessOptions | None = No
         normalized = _ASCII_SPACE_BEFORE_JP_PUNCT.sub("", normalized)
         normalized = _SPACE_AFTER_JP_PUNCT.sub("", normalized)
 
-    normalized = _limit_commas(normalized, config.max_comma)
-    normalized = _MULTI_SPACE.sub(" ", normalized)
-    return normalized.strip()
+    return _MULTI_SPACE.sub(" ", normalized).strip()
 
 
 def _is_terminal_text(text: str) -> bool:
@@ -346,6 +346,9 @@ def postprocess_japanese_segments(
 
     for segment in merged_segments:
         segment.text = process_text(segment.text, config)
+        # 쉼표 제한은 마지막에 한 번만 적용한다. 앞 단계에서 하면 쉼표 자리에 넣은 공백이
+        # 다음 정리 단계(일본어 사이 공백 제거)에서 지워져 단어가 붙어 버린다.
+        segment.text = _MULTI_SPACE.sub(" ", _limit_commas(segment.text, config.max_comma)).strip()
         if config.sentence:
             if config.enhanced:
                 if _is_terminal_with_dictionary(segment.text) and not _has_terminal_punctuation(segment.text):
