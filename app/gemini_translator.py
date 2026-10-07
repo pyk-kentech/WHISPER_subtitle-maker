@@ -81,6 +81,10 @@ class ResponseFormatError(TranslationError):
     pass
 
 
+class TranslationCancelled(Exception):
+    """프로그램 종료 등으로 번역을 멈출 때 쓴다. 번역 실패(TranslationError)와 구분된다."""
+
+
 class TranslationUnavailableError(TranslationError):
     """키·모델·할당량 문제라 청크를 쪼개 다시 보내도 해결되지 않는 실패."""
 
@@ -118,6 +122,7 @@ class GeminiTranslator:
         self._quota_exhausted = False
         self.token_usage = {"prompt": 0, "output": 0, "thinking": 0}
         self._clients: dict[str, genai.Client] = {}
+        self.cancel_check: Callable[[], bool] | None = None
         self._thinking_levels: dict[str, str | None] = {}
         # 사용자가 정한 요청 간격은 최소값으로 지킨다(무료 티어 분당 한도 보호).
         self._base_delay_seconds = max(self.config.min_adaptive_delay_seconds, float(self.config.request_delay_seconds))
@@ -355,7 +360,7 @@ class GeminiTranslator:
                     f"All keys/models are rate-limited or unavailable. Waiting {self.config.wait_seconds_when_exhausted} seconds "
                     f"before retry ({exhausted_waits}/{self.config.max_exhausted_waits})."
                 )
-                time.sleep(self.config.wait_seconds_when_exhausted)
+                self._sleep(self.config.wait_seconds_when_exhausted)
                 continue
             raise TranslationUnavailableError(
                 f"No available Gemini key/model combination could complete the translation: {last_error or 'no usable model'}"
@@ -412,6 +417,18 @@ class GeminiTranslator:
         if not text.strip():
             raise ResponseFormatError(f"Received an empty response (finish_reason={finish_reason or 'none'}).")
         return text
+
+    def _sleep(self, seconds: float) -> None:
+        # 긴 대기(최대 60초) 중에도 종료 요청을 빨리 반영하도록 잘게 나눠 잔다.
+        remaining = max(0.0, seconds)
+        while True:
+            if self.cancel_check is not None and self.cancel_check():
+                raise TranslationCancelled()
+            if remaining <= 0:
+                return
+            step = min(0.5, remaining)
+            time.sleep(step)
+            remaining -= step
 
     def _thinking_level_for(self, model_name: str) -> str | None:
         if model_name in self._thinking_levels:
@@ -494,14 +511,14 @@ class GeminiTranslator:
         if self._last_request_monotonic <= 0:
             if target_delay > 0:
                 self.log_callback(f"Request delay {target_delay:.1f}s before Gemini call")
-                time.sleep(target_delay)
+                self._sleep(target_delay)
             return
 
         elapsed = time.monotonic() - self._last_request_monotonic
         remaining = target_delay - elapsed
         if remaining > 0:
             self.log_callback(f"Request delay {remaining:.1f}s before Gemini call")
-            time.sleep(remaining)
+            self._sleep(remaining)
 
     def _on_request_success(self) -> None:
         self._adaptive_delay_seconds = max(self._base_delay_seconds, self._adaptive_delay_seconds - 0.2)

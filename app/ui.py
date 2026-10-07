@@ -118,6 +118,9 @@ from .workers import (
 )
 
 
+# --windowed 빌드에서 shutdown 명령을 실행할 때 콘솔 창이 깜빡이지 않게 한다(Windows 전용 플래그).
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 GREEN_BAR_STYLE = """
 QProgressBar {
     border: 1px solid #9bb49f;
@@ -1067,7 +1070,7 @@ class MainWindow(QMainWindow):
         self.raise_()
 
     def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
-        if reason in {QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick}:
+        if reason == QSystemTrayIcon.Trigger:
             if self.isVisible():
                 self.hide_to_tray()
             else:
@@ -1343,14 +1346,17 @@ class MainWindow(QMainWindow):
             if not self._split_worker.wait(10000):
                 self._split_worker.terminate()
                 self._split_worker.wait(2000)
+        if self._pipeline_worker is not None and self._pipeline_worker.isRunning():
+            self._pipeline_worker.request_stop()
         for worker in (self._download_worker, self._pipeline_worker, self._subtitle_translation_worker):
             if worker is None or not worker.isRunning():
                 continue
             worker.requestInterruption()
-            worker.quit()
-            if not worker.wait(1200):
+            # 작업 스레드는 진행률 콜백·파일 사이에서 중단 요청을 확인하고 스스로 끝난다.
+            # 모델 다운로드처럼 중간에 멈출 수 없는 경우에만 마지막 수단으로 강제 종료한다.
+            if not worker.wait(8000):
                 worker.terminate()
-                worker.wait(1200)
+                worker.wait(2000)
 
     def _populate_runtime_choices(self) -> None:
         saved = get_default_runtime_choice()
@@ -1459,17 +1465,25 @@ class MainWindow(QMainWindow):
         self.translation_settings_status.setText("저장되지 않은 변경사항")
 
     def save_translation_inputs(self) -> None:
-        self._saved_api_keys_text = self.keys_edit.toPlainText()
-        self._saved_deepl_api_key = self.deepl_key_edit.text().strip()
-        self._translator_settings = self.collect_translation_inputs()
+        keys_text = self.keys_edit.toPlainText()
+        deepl_key = self.deepl_key_edit.text().strip()
+        settings = self.collect_translation_inputs()
+        # 디스크·자격 증명 저장이 모두 성공한 뒤에만 메모리 값을 바꾼다(일부만 반영되는 상태 방지).
         try:
-            save_api_keys(self._saved_api_keys_text)
-            save_deepl_api_key(self._saved_deepl_api_key)
-            save_translator_settings(self._translator_settings)
+            save_translator_settings(settings)
+            save_api_keys(keys_text)
+            save_deepl_api_key(deepl_key)
         except CredentialStoreError as exc:
             self.log(f"API 키 보안 저장 실패: {exc}", logging.ERROR)
             QMessageBox.warning(self, APP_NAME, f"API 키를 안전하게 저장하지 못했습니다.\n\n{exc}")
             return
+        except OSError as exc:
+            self.log(f"번역 설정 저장 실패: {exc}", logging.ERROR)
+            QMessageBox.warning(self, APP_NAME, f"번역 설정 파일을 저장하지 못했습니다.\n\n{exc}")
+            return
+        self._saved_api_keys_text = keys_text
+        self._saved_deepl_api_key = deepl_key
+        self._translator_settings = settings
         self._settings_dirty = False
         self.sync_translation_save_state()
         self.translation_settings_status.setText("설정이 저장되었습니다")
@@ -1622,10 +1636,11 @@ class MainWindow(QMainWindow):
 
         if added_count:
             self.log(f"파일 {added_count}개 추가")
-            if self._processing:
-                self.log("진행 중 추가된 파일은 현재 작업이 끝난 뒤 이어서 처리됩니다.")
-                if self._pipeline_worker is not None and self._pipeline_worker.isRunning():
-                    self._pipeline_worker.add_paths(added_paths)
+            if self._processing and self._pipeline_worker is not None and self._pipeline_worker.isRunning():
+                if self._pipeline_worker.add_paths(added_paths):
+                    self.log("진행 중 추가된 파일은 현재 작업에 이어서 처리됩니다.")
+                else:
+                    self.log("현재 작업이 마무리되는 중이라 추가한 파일은 다음에 '시작'을 누르면 처리됩니다.")
             self.refresh_queue_progress()
             self.update_file_area_mode()
         self.update_controls()
@@ -1679,8 +1694,10 @@ class MainWindow(QMainWindow):
         if added_count:
             self.subtitle_log_view.append(f"자막 파일 {added_count}개 추가")
             if self._subtitle_translation_processing and self._subtitle_translation_worker is not None and self._subtitle_translation_worker.isRunning():
-                self.subtitle_log_view.append("진행 중 추가된 파일은 현재 작업 뒤에 이어서 처리됩니다.")
-                self._subtitle_translation_worker.add_paths(added_paths)
+                if self._subtitle_translation_worker.add_paths(added_paths):
+                    self.subtitle_log_view.append("진행 중 추가된 파일은 현재 작업 뒤에 이어서 처리됩니다.")
+                else:
+                    self.subtitle_log_view.append("현재 작업이 마무리되는 중이라 추가한 파일은 다음에 시작하면 처리됩니다.")
             self.refresh_subtitle_queue_progress()
             self.update_subtitle_file_area_mode()
         self.update_controls()
@@ -1769,7 +1786,8 @@ class MainWindow(QMainWindow):
         if self._subtitle_translation_worker is not None and self._subtitle_translation_worker.isRunning():
             removed_paths, blocked_paths = self._subtitle_translation_worker.remove_paths(removable_paths)
             blocked_count = len(blocked_paths)
-            removed_count = self._remove_subtitle_paths(removed_paths)
+            finished_paths = [path for path in removable_paths if path not in removed_paths and path not in blocked_paths]
+            removed_count = len(set(removed_paths)) + self._remove_subtitle_paths(finished_paths + removed_paths)
         else:
             removed_count = self._remove_subtitle_paths(removable_paths)
         if removed_count:
@@ -1914,7 +1932,9 @@ class MainWindow(QMainWindow):
         if self._pipeline_worker is not None and self._pipeline_worker.isRunning():
             removed_paths, blocked_paths = self._pipeline_worker.remove_paths(removable_paths)
             blocked_count = len(blocked_paths)
-            removed_count = self._remove_paths(removed_paths)
+            # 대기열에 없는(이미 끝난·실패·스킵) 행은 작업과 무관하므로 바로 지운다.
+            finished_paths = [path for path in removable_paths if path not in removed_paths and path not in blocked_paths]
+            removed_count = len(set(removed_paths)) + self._remove_paths(finished_paths + removed_paths)
         else:
             removed_count = self._remove_paths(removable_paths)
         if removed_count:
@@ -2220,7 +2240,7 @@ class MainWindow(QMainWindow):
         if not self.shutdown_after_complete_checkbox.isChecked() or self._shutdown_scheduled:
             return
         try:
-            subprocess.run(["shutdown", "/s", "/t", "120"], check=True, capture_output=True, text=True)
+            subprocess.run(["shutdown", "/s", "/t", "120"], check=True, capture_output=True, text=True, creationflags=_NO_WINDOW)
         except Exception as exc:
             message = f"{job_label} 완료 후 자동 종료 예약에 실패했습니다: {str(exc) or exc.__class__.__name__}"
             self.log(message)
@@ -2237,7 +2257,7 @@ class MainWindow(QMainWindow):
 
     def _cancel_scheduled_shutdown(self) -> None:
         try:
-            subprocess.run(["shutdown", "/a"], check=True, capture_output=True, text=True)
+            subprocess.run(["shutdown", "/a"], check=True, capture_output=True, text=True, creationflags=_NO_WINDOW)
         except Exception as exc:
             self.log(f"예약된 시스템 종료 취소에 실패했습니다: {str(exc) or exc.__class__.__name__}")
             return

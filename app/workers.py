@@ -32,7 +32,7 @@ from .file_queue import (
     STATUS_TRANSCRIBING,
     STATUS_TRANSLATING,
 )
-from .gemini_translator import GeminiTranslator, TranslationConfig, TranslationError
+from .gemini_translator import GeminiTranslator, TranslationCancelled, TranslationConfig, TranslationError
 from .japanese_postprocess import PostprocessOptions, postprocess_japanese_segments
 from .model_manager import download_model, get_download_plan, get_model_dir, is_model_ready
 from .srt_writer import build_srt_text, write_srt_text
@@ -103,6 +103,10 @@ class SaveTask:
     note: str = ""
 
 
+# 프로그램 종료로 작업을 중단할 때 진행 중 단계를 빠져나오는 데 쓴다(번역기 대기 중 취소와 같은 예외).
+WorkerStopped = TranslationCancelled
+
+
 @dataclass(slots=True)
 class TranslationOutcome:
     translations: dict[str, str]
@@ -116,6 +120,7 @@ def create_translators(
     deepl_api_key: str,
     source_language: str,
     log_callback,
+    cancel_check=None,
 ) -> tuple[GeminiTranslator | None, DeepLTranslator | None]:
     gemini_translator = None
     if api_keys:
@@ -150,6 +155,9 @@ def create_translators(
 
     if gemini_translator is None and deepl_translator is None:
         raise RuntimeError("번역용 Gemini API 키가 비어 있습니다. 번역 설정 탭에서 입력하세요.")
+    for translator in (gemini_translator, deepl_translator):
+        if translator is not None:
+            translator.cancel_check = cancel_check
     return gemini_translator, deepl_translator
 
 
@@ -159,6 +167,8 @@ def translate_records(records, gemini_translator, deepl_translator, progress_cal
     if gemini_translator is not None:
         try:
             translations = gemini_translator.translate_lines(records, progress_callback, file_name)
+        except WorkerStopped:
+            raise
         except Exception as exc:
             translations = dict(getattr(exc, "partial", None) or {})
             gemini_aborted = True
@@ -169,6 +179,8 @@ def translate_records(records, gemini_translator, deepl_translator, progress_cal
         log_callback(f"{file_name} | 번역되지 않은 {len(missing)}줄을 DeepL Free API로 번역합니다.")
         try:
             translations.update(deepl_translator.translate_lines(missing, progress_callback, file_name))
+        except WorkerStopped:
+            raise
         except Exception as exc:
             translations.update(getattr(exc, "partial", None) or {})
             log_callback(f"{file_name} | DeepL 번역 실패 -> {str(exc) or exc.__class__.__name__}")
@@ -243,6 +255,7 @@ class PipelineWorker(QThread):
         self._current_path: str | None = None
         self._pause_requested = False
         self._stop_requested = False
+        self._closed = False
         self._processed = 0
         self._success_count = 0
         self._failure_count = 0
@@ -257,8 +270,11 @@ class PipelineWorker(QThread):
             return self._current_path
 
     def add_paths(self, paths: list[str]) -> int:
+        """대기열에 추가한 개수를 돌려준다. 작업이 이미 마무리 단계면 0(다음 시작 때 처리)."""
         added = 0
         with self._condition:
+            if self._closed or self._stop_requested:
+                return 0
             for path in paths:
                 if path in self._queued_paths or path == self._current_path:
                     continue
@@ -333,6 +349,7 @@ class PipelineWorker(QThread):
                     self.job.deepl_api_key,
                     self.job.source_language,
                     self.log_message.emit,
+                    lambda: self._stop_requested or self.isInterruptionRequested(),
                 )
 
             runtime_config = build_runtime_config(self.job.runtime_device, self.job.runtime_tuning)
@@ -489,6 +506,9 @@ class PipelineWorker(QThread):
                     self.log_message.emit(f"{source_path} | 저장 큐 등록 -> {output_path}")
                     self.stage_changed.emit("저장", "자막 저장 큐 등록")
                     self.stage_progress_changed.emit(100, 0.0, 0.0)
+                except WorkerStopped:
+                    self.item_status_changed.emit(source_str, STATUS_PENDING, "종료로 중단됨")
+                    self.log_message.emit(f"{source_path} | 프로그램 종료로 중단")
                 except Exception as exc:
                     with self._counter_lock:
                         self._failure_count += 1
@@ -579,11 +599,12 @@ class PipelineWorker(QThread):
     def _next_source(self) -> tuple[str | None, int, int]:
         with self._condition:
             while True:
-                while self._pause_requested:
+                while self._pause_requested and not self._stop_requested:
                     self.processing_state_changed.emit(STATUS_PAUSED, "일시 중지됨")
                     self._condition.wait()
 
                 if self._stop_requested:
+                    self._closed = True
                     return None, self._processed, self._processed
 
                 if self._pending_paths:
@@ -594,7 +615,14 @@ class PipelineWorker(QThread):
                     self.processing_state_changed.emit(STATUS_TRANSCRIBING, "처리 중")
                     return source_str, index, total
 
+                self._closed = True
                 return None, self._processed, self._processed
+
+    def request_stop(self) -> None:
+        """프로그램 종료 시 호출: 진행 중 파일을 멈추고(일시 중지 상태여도) 스레드를 끝낸다."""
+        with self._condition:
+            self._stop_requested = True
+            self._condition.notify_all()
 
     def _complete_current(self) -> None:
         with self._condition:
@@ -611,9 +639,11 @@ class PipelineWorker(QThread):
 
     def _pause_checkpoint(self, detail: str) -> None:
         with self._condition:
-            while self._pause_requested:
+            while self._pause_requested and not self._stop_requested:
                 self.processing_state_changed.emit(STATUS_PAUSED, detail)
                 self._condition.wait()
+            if self._stop_requested:
+                raise WorkerStopped()
 
     def _make_stage_progress_callback(self):
         def callback(percent: int, current: float, total: float) -> None:
@@ -696,36 +726,59 @@ class SubtitleTranslationWorker(QThread):
         self._success_count = 0
         self._failure_count = 0
         self._skipped_count = 0
+        self._queue_lock = threading.Lock()
+        self._closed = False
 
     def add_paths(self, paths: list[str]) -> int:
+        """대기열에 추가한 개수를 돌려준다. 작업이 이미 마무리 단계면 0(다음 시작 때 처리)."""
         added = 0
-        for path in paths:
-            if path in self._queued_paths or path == self._current_path:
-                continue
-            self._pending_paths.append(path)
-            self._queued_paths.add(path)
-            added += 1
+        with self._queue_lock:
+            if self._closed:
+                return 0
+            for path in paths:
+                if path in self._queued_paths or path == self._current_path:
+                    continue
+                self._pending_paths.append(path)
+                self._queued_paths.add(path)
+                added += 1
+            total = self._processed + len(self._pending_paths) + (1 if self._current_path else 0)
         if added:
-            self.queue_progress_changed.emit(self._processed, self._processed + len(self._pending_paths) + (1 if self._current_path else 0))
+            self.queue_progress_changed.emit(self._processed, total)
         return added
 
     def remove_paths(self, paths: list[str]) -> tuple[list[str], list[str]]:
         removed: list[str] = []
         blocked: list[str] = []
         keep: list[str] = []
-        for path in list(self._pending_paths):
-            if path in paths:
-                removed.append(path)
-                self._queued_paths.discard(path)
-            else:
-                keep.append(path)
-        for path in paths:
-            if path == self._current_path:
-                blocked.append(path)
-        self._pending_paths = deque(keep)
+        with self._queue_lock:
+            for path in self._pending_paths:
+                if path in paths:
+                    removed.append(path)
+                    self._queued_paths.discard(path)
+                else:
+                    keep.append(path)
+            for path in paths:
+                if path == self._current_path:
+                    blocked.append(path)
+            self._pending_paths = deque(keep)
+            total = self._processed + len(self._pending_paths) + (1 if self._current_path else 0)
         if removed:
-            self.queue_progress_changed.emit(self._processed, self._processed + len(self._pending_paths) + (1 if self._current_path else 0))
+            self.queue_progress_changed.emit(self._processed, total)
         return removed, blocked
+
+    def _next_source(self) -> tuple[str | None, int, int]:
+        with self._queue_lock:
+            if not self._pending_paths or self.isInterruptionRequested():
+                self._closed = True
+                return None, self._processed, self._processed
+            source_str = self._pending_paths.popleft()
+            self._current_path = source_str
+            return source_str, self._processed + 1, self._processed + len(self._pending_paths) + 1
+
+    def _progress_callback(self, *args) -> None:
+        if self.isInterruptionRequested():
+            raise WorkerStopped()
+        self.translation_progress_changed.emit(*args)
 
     def run(self) -> None:
         try:
@@ -735,15 +788,15 @@ class SubtitleTranslationWorker(QThread):
                 self.job.deepl_api_key,
                 self.job.source_language,
                 self.log_message.emit,
+                self.isInterruptionRequested,
             )
 
-            while self._pending_paths:
-                source_str = self._pending_paths.popleft()
-                self._current_path = source_str
+            while True:
+                source_str, index, total = self._next_source()
+                if source_str is None:
+                    break
                 source_path = Path(source_str)
                 output_path = build_translated_subtitle_output_path(source_path, self.job.translator_settings.target_language)
-                total = self._processed + len(self._pending_paths) + 1
-                index = self._processed + 1
                 self.file_started.emit(index, total, source_str)
                 if gemini_translator is not None:
                     self.translation_progress_changed.emit(
@@ -777,7 +830,7 @@ class SubtitleTranslationWorker(QThread):
                         records,
                         gemini_translator,
                         deepl_translator,
-                        self.translation_progress_changed.emit,
+                        self._progress_callback,
                         source_path.name,
                         self.log_message.emit,
                     )
@@ -794,6 +847,9 @@ class SubtitleTranslationWorker(QThread):
                     self.item_status_changed.emit(source_str, STATUS_DONE, done_message)
                     self.log_message.emit(f"{source_path} | 완료 -> {done_message}")
                     self.stage_changed.emit("저장", "자막 저장 완료")
+                except WorkerStopped:
+                    self.item_status_changed.emit(source_str, STATUS_PENDING, "종료로 중단됨")
+                    self.log_message.emit(f"{source_path} | 프로그램 종료로 중단")
                 except Exception as exc:
                     self._failure_count += 1
                     message = str(exc) or exc.__class__.__name__
@@ -801,11 +857,13 @@ class SubtitleTranslationWorker(QThread):
                     self.log_message.emit(f"{source_path} | 실패 -> {message}")
                     self.stage_changed.emit("실패", message)
                 finally:
-                    if self._current_path is not None:
-                        self._queued_paths.discard(self._current_path)
-                        self._current_path = None
-                        self._processed += 1
-                    self.queue_progress_changed.emit(self._processed, self._processed + len(self._pending_paths))
+                    with self._queue_lock:
+                        if self._current_path is not None:
+                            self._queued_paths.discard(self._current_path)
+                            self._current_path = None
+                            self._processed += 1
+                        total = self._processed + len(self._pending_paths)
+                    self.queue_progress_changed.emit(self._processed, total)
 
             if gemini_translator is not None:
                 self.log_message.emit(gemini_translator.token_usage_summary)

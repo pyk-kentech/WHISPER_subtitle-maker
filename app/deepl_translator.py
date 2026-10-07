@@ -8,7 +8,7 @@ from typing import Callable
 from urllib import error, request
 
 from .config import DEEPL_FREE_API_URL
-from .gemini_translator import TranslationError
+from .gemini_translator import TranslationCancelled, TranslationError
 
 
 LogCallback = Callable[[str], None]
@@ -59,6 +59,7 @@ class DeepLTranslator:
         self.log_callback = log_callback
         self.error_count = 0
         self._last_request_monotonic = 0.0
+        self.cancel_check: Callable[[], bool] | None = None
 
     @property
     def current_key_display(self) -> str:
@@ -95,7 +96,7 @@ class DeepLTranslator:
                     raise
                 wait = RETRY_WAIT_SECONDS[attempt]
                 self.log_callback(f"[{file_name}] DeepL 일시 오류, {wait:.0f}초 후 다시 시도합니다: {exc}")
-                time.sleep(wait)
+                self._sleep(wait)
             finally:
                 self._last_request_monotonic = time.monotonic()
         raise TranslationError("DeepL request failed.")
@@ -198,16 +199,27 @@ class DeepLTranslator:
 
         return results
 
+    def _sleep(self, seconds: float) -> None:
+        remaining = max(0.0, seconds)
+        while True:
+            if self.cancel_check is not None and self.cancel_check():
+                raise TranslationCancelled()
+            if remaining <= 0:
+                return
+            step = min(0.5, remaining)
+            time.sleep(step)
+            remaining -= step
+
     def _sleep_for_request_spacing(self) -> None:
         delay = max(0.0, float(self.config.request_delay_seconds))
         if delay <= 0:
             return
         if self._last_request_monotonic <= 0:
             self.log_callback(f"Request delay {delay:.1f}s before DeepL call")
-            time.sleep(delay)
+            self._sleep(delay)
             return
         elapsed = time.monotonic() - self._last_request_monotonic
         remaining = delay - elapsed
         if remaining > 0:
             self.log_callback(f"Request delay {remaining:.1f}s before DeepL call")
-            time.sleep(remaining)
+            self._sleep(remaining)

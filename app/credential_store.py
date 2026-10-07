@@ -6,6 +6,7 @@ from ctypes import wintypes
 
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
+CRED_MAX_CREDENTIAL_BLOB_SIZE = 5 * 512
 ERROR_NOT_FOUND = 1168
 
 
@@ -48,8 +49,8 @@ class CREDENTIALW(ctypes.Structure):
 
 PCREDENTIALW = ctypes.POINTER(CREDENTIALW)
 
-_advapi32 = ctypes.WinDLL("Advapi32.dll")
-_kernel32 = ctypes.WinDLL("Kernel32.dll")
+# use_last_error=True: 실패 직후의 Windows 오류 코드를 ctypes.get_last_error()로 정확히 읽는다.
+_advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
 
 _CredWriteW = _advapi32.CredWriteW
 _CredWriteW.argtypes = [ctypes.POINTER(CREDENTIALW), wintypes.DWORD]
@@ -67,12 +68,14 @@ _CredFree = _advapi32.CredFree
 _CredFree.argtypes = [ctypes.c_void_p]
 _CredFree.restype = None
 
-_GetLastError = _kernel32.GetLastError
-_GetLastError.restype = wintypes.DWORD
 
 
 def save_secret(target_name: str, secret: str, user_name: str = "DongeumSubMaker") -> None:
     secret_bytes = secret.encode("utf-16-le")
+    if len(secret_bytes) > CRED_MAX_CREDENTIAL_BLOB_SIZE:
+        raise CredentialStoreError(
+            f"저장할 값이 Windows 자격 증명 한도({CRED_MAX_CREDENTIAL_BLOB_SIZE}바이트)를 넘습니다."
+        )
     blob = (ctypes.c_ubyte * len(secret_bytes)).from_buffer_copy(secret_bytes) if secret_bytes else None
 
     credential = CREDENTIALW()
@@ -89,13 +92,13 @@ def save_secret(target_name: str, secret: str, user_name: str = "DongeumSubMaker
     credential.UserName = user_name
 
     if not _CredWriteW(ctypes.byref(credential), 0):
-        raise CredentialStoreError(f"CredWriteW failed with error {_GetLastError()}")
+        raise CredentialStoreError(f"CredWriteW failed with error {ctypes.get_last_error()}")
 
 
 def load_secret(target_name: str) -> str:
     credential_ptr = PCREDENTIALW()
     if not _CredReadW(target_name, CRED_TYPE_GENERIC, 0, ctypes.byref(credential_ptr)):
-        error = _GetLastError()
+        error = ctypes.get_last_error()
         if error == ERROR_NOT_FOUND:
             return ""
         raise CredentialStoreError(f"CredReadW failed with error {error}")
@@ -113,6 +116,6 @@ def load_secret(target_name: str) -> str:
 
 def delete_secret(target_name: str) -> None:
     if not _CredDeleteW(target_name, CRED_TYPE_GENERIC, 0):
-        error = _GetLastError()
+        error = ctypes.get_last_error()
         if error != ERROR_NOT_FOUND:
             raise CredentialStoreError(f"CredDeleteW failed with error {error}")

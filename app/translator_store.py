@@ -77,9 +77,53 @@ def save_translator_settings(settings: TranslatorSettings) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# Windows 일반 자격 증명 하나에는 2560바이트(UTF-16으로 약 1280자)까지만 담기므로 키가 많으면 나눠 저장한다.
+_KEYS_PART_LIMIT_BYTES = 2400
+_MAX_KEY_PARTS = 64
+
+
+def _key_part_name(index: int) -> str:
+    return API_KEYS_CREDENTIAL_NAME if index == 0 else f"{API_KEYS_CREDENTIAL_NAME}#{index + 1}"
+
+
+def _split_key_parts(normalized: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    for line in normalized.splitlines():
+        candidate = "\n".join([*current, line])
+        if current and len(candidate.encode("utf-16-le")) > _KEYS_PART_LIMIT_BYTES:
+            parts.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        parts.append("\n".join(current))
+    return parts
+
+
+def _load_key_parts() -> str:
+    lines: list[str] = []
+    for index in range(_MAX_KEY_PARTS):
+        part = load_secret(_key_part_name(index))
+        if not part:
+            break
+        lines.append(part)
+    return "\n".join(lines)
+
+
+def _save_key_parts(normalized: str) -> None:
+    parts = _split_key_parts(normalized) if normalized else []
+    for index, part in enumerate(parts):
+        save_secret(_key_part_name(index), part)
+    for index in range(len(parts), _MAX_KEY_PARTS):
+        if not load_secret(_key_part_name(index)):
+            break
+        delete_secret(_key_part_name(index))
+
+
 def load_api_keys() -> list[str]:
     try:
-        stored = load_secret(API_KEYS_CREDENTIAL_NAME)
+        stored = _load_key_parts()
     except CredentialStoreError:
         stored = ""
 
@@ -94,7 +138,7 @@ def load_api_keys() -> list[str]:
     normalized = "\n".join(line.strip() for line in plaintext.splitlines() if line.strip())
     if normalized:
         try:
-            save_secret(API_KEYS_CREDENTIAL_NAME, normalized)
+            _save_key_parts(normalized)
             path.unlink(missing_ok=True)
         except CredentialStoreError:
             pass
@@ -105,10 +149,7 @@ def save_api_keys(keys_text: str) -> None:
     normalized = "\n".join(line.strip() for line in keys_text.splitlines() if line.strip())
     path = get_translator_keys_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    if normalized:
-        save_secret(API_KEYS_CREDENTIAL_NAME, normalized)
-    else:
-        delete_secret(API_KEYS_CREDENTIAL_NAME)
+    _save_key_parts(normalized)
     if path.exists():
         path.unlink(missing_ok=True)
 

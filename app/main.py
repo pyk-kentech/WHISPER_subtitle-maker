@@ -51,12 +51,13 @@ def _acquire_single_instance() -> bool:
     if sys.platform != "win32":
         return True
     try:
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
         mutex = kernel32.CreateMutexW(None, False, "Global\\DongeumSubMakerSingleInstance")
         if not mutex:
             return True
         _SINGLE_INSTANCE_MUTEX = mutex
-        return kernel32.GetLastError() != 183
+        return ctypes.get_last_error() != 183
     except Exception:
         return True
 
