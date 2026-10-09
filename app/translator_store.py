@@ -7,6 +7,9 @@ from .config import (
     API_KEYS_CREDENTIAL_NAME,
     DEEPL_API_KEY_CREDENTIAL_NAME,
     DEFAULT_OUTPUT_LANGUAGE,
+    DEFAULT_TRANSLATION_PROVIDER,
+    OPENAI_COMPAT_API_KEY_CREDENTIAL_NAME,
+    RUNPOD_API_KEY_CREDENTIAL_NAME,
     DEFAULT_TRANSLATION_CHUNK_SIZE,
     DEFAULT_TRANSLATION_REQUEST_DELAY_SECONDS,
     DEFAULT_TRANSLATION_REASONING_LEVEL,
@@ -36,6 +39,12 @@ class TranslatorSettings:
     reasoning_level: str = DEFAULT_TRANSLATION_REASONING_LEVEL
     system_prompt: str = DEFAULT_TRANSLATION_SYSTEM_PROMPT
     translation_note: str = ""
+    # "gemini" 또는 "openai"(OpenAI 호환 LLM 서버)
+    provider: str = DEFAULT_TRANSLATION_PROVIDER
+    # Gemini가 끝까지 실패한 줄(한도 소진·차단 등)을 LLM 서버로 다시 번역한다.
+    use_openai_fallback: bool = False
+    openai_base_url: str = ""
+    openai_model: str = ""
 
 
 def load_translator_settings() -> TranslatorSettings:
@@ -67,6 +76,10 @@ def load_translator_settings() -> TranslatorSettings:
         reasoning_level=str(data.get("reasoning_level", DEFAULT_TRANSLATION_REASONING_LEVEL)),
         system_prompt=system_prompt,
         translation_note=str(data.get("translation_note", "")),
+        provider=str(data.get("provider", DEFAULT_TRANSLATION_PROVIDER)),
+        use_openai_fallback=bool(data.get("use_openai_fallback", False)),
+        openai_base_url=str(data.get("openai_base_url", "")),
+        openai_model=str(data.get("openai_model", "")),
     )
 
 
@@ -162,8 +175,35 @@ def load_deepl_api_key() -> str:
 
 
 def save_deepl_api_key(api_key: str) -> None:
-    normalized = api_key.strip()
+    _save_or_delete(DEEPL_API_KEY_CREDENTIAL_NAME, api_key)
+
+
+def _load_quiet(name: str) -> str:
+    try:
+        return load_secret(name).strip()
+    except CredentialStoreError:
+        return ""
+
+
+def _save_or_delete(name: str, value: str) -> None:
+    normalized = value.strip()
     if normalized:
-        save_secret(DEEPL_API_KEY_CREDENTIAL_NAME, normalized)
+        save_secret(name, normalized)
     else:
-        delete_secret(DEEPL_API_KEY_CREDENTIAL_NAME)
+        delete_secret(name)
+
+
+def load_openai_api_key() -> str:
+    return _load_quiet(OPENAI_COMPAT_API_KEY_CREDENTIAL_NAME)
+
+
+def save_openai_api_key(api_key: str) -> None:
+    _save_or_delete(OPENAI_COMPAT_API_KEY_CREDENTIAL_NAME, api_key)
+
+
+def load_runpod_api_key() -> str:
+    return _load_quiet(RUNPOD_API_KEY_CREDENTIAL_NAME)
+
+
+def save_runpod_api_key(api_key: str) -> None:
+    _save_or_delete(RUNPOD_API_KEY_CREDENTIAL_NAME, api_key)

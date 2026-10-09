@@ -8,7 +8,14 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.file_download import DryRunFileInfo
 from tqdm.auto import tqdm
 
-from .config import DEFAULT_MODEL_KEY, MODEL_PRESETS, MODEL_REQUIRED_FILES, get_hf_cache_dir, get_model_cache_dir_for
+from .config import (
+    AUX_MODEL_PRESETS,
+    DEFAULT_MODEL_KEY,
+    MODEL_PRESETS,
+    MODEL_REQUIRED_FILES,
+    get_hf_cache_dir,
+    get_model_cache_dir_for,
+)
 
 
 ProgressCallback = Callable[[int, int, str, int, int], None]
@@ -88,14 +95,34 @@ class HubProgressTqdm(tqdm):
         super().close()
 
 
+def get_model_preset(model_key: str = DEFAULT_MODEL_KEY) -> dict:
+    return MODEL_PRESETS.get(model_key, MODEL_PRESETS[DEFAULT_MODEL_KEY])
+
+
+def get_model_languages(model_key: str = DEFAULT_MODEL_KEY) -> tuple[str, ...]:
+    """모델이 지원하는 입력 언어. 비어 있으면 Whisper처럼 모든 언어(자동 감지 포함)."""
+    return tuple(get_model_preset(model_key).get("languages", ()))
+
+
+def model_requires_vad(model_key: str = DEFAULT_MODEL_KEY) -> bool:
+    return get_model_preset(model_key).get("segmentation") == "vad_clips"
+
+
+def get_model_note(model_key: str = DEFAULT_MODEL_KEY) -> str:
+    return str(get_model_preset(model_key).get("note", ""))
+
+
+def _download_preset(model_key: str) -> dict:
+    """다운로드용: 음성 인식 모델과 보조 모델(VAD)을 모두 찾는다."""
+    return AUX_MODEL_PRESETS.get(model_key) or MODEL_PRESETS.get(model_key, MODEL_PRESETS[DEFAULT_MODEL_KEY])
+
+
 def get_model_repo_id(model_key: str = DEFAULT_MODEL_KEY) -> str:
-    preset = MODEL_PRESETS.get(model_key, MODEL_PRESETS[DEFAULT_MODEL_KEY])
-    return str(preset["repo_id"])
+    return str(_download_preset(model_key)["repo_id"])
 
 
 def get_model_label(model_key: str = DEFAULT_MODEL_KEY) -> str:
-    preset = MODEL_PRESETS.get(model_key, MODEL_PRESETS[DEFAULT_MODEL_KEY])
-    return str(preset["label"])
+    return str(_download_preset(model_key)["label"])
 
 
 def get_model_dir(model_key: str = DEFAULT_MODEL_KEY) -> Path:
@@ -103,8 +130,7 @@ def get_model_dir(model_key: str = DEFAULT_MODEL_KEY) -> Path:
 
 
 def get_required_files(model_key: str = DEFAULT_MODEL_KEY) -> tuple[str, ...]:
-    preset = MODEL_PRESETS.get(model_key, MODEL_PRESETS[DEFAULT_MODEL_KEY])
-    return tuple(preset.get("files", MODEL_REQUIRED_FILES))
+    return tuple(_download_preset(model_key).get("files", MODEL_REQUIRED_FILES))
 
 
 def is_model_ready(model_dir: Path | None = None, model_key: str = DEFAULT_MODEL_KEY) -> bool:

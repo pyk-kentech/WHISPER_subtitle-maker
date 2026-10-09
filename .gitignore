@@ -14,3 +14,25 @@ __pycache__/
 *.srt
 .env
 .env.*
+.venv-linux/
+
+# ASR 평가: 구매 작품 대본에서 뽑은 대사·인식 결과·모델은 올리지 않는다
+eval/data/
+eval/out/
+eval/vad/
+eval/venv/
+eval/results.json
+eval/vad_results.json
+eval/whisperseg/model.onnx
+HANDOFF.md
+PROMPT_NEXT.md
+eval/out/
+eval/pod_logs/
+eval/translate/out/
+eval/translate/set_*.json
+eval/translate/*.log
+eval/translate/synthetic_r18.txt
+eval/cpu_bench*.json
+eval/cpu_bench*.log
+eval/LOG.md
+.pytest_cache/

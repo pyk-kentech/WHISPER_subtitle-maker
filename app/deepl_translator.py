@@ -8,7 +8,7 @@ from typing import Callable
 from urllib import error, request
 
 from .config import DEEPL_FREE_API_URL
-from .gemini_translator import TranslationCancelled, TranslationError
+from .gemini_translator import NetworkWaiter, TranslationCancelled, TranslationError
 
 
 LogCallback = Callable[[str], None]
@@ -60,6 +60,7 @@ class DeepLTranslator:
         self.error_count = 0
         self._last_request_monotonic = 0.0
         self.cancel_check: Callable[[], bool] | None = None
+        self.network = NetworkWaiter(log_callback)
 
     @property
     def current_key_display(self) -> str:
@@ -89,7 +90,7 @@ class DeepLTranslator:
         for attempt in range(len(RETRY_WAIT_SECONDS) + 1):
             self._sleep_for_request_spacing()
             try:
-                return self._translate_chunk(chunk)
+                return self.network.run(lambda: self._translate_chunk(chunk), self._sleep)
             except DeepLRetryableError as exc:
                 self.error_count += 1
                 if attempt >= len(RETRY_WAIT_SECONDS):

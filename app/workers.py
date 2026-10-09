@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
+import dataclasses
 import queue
+import tempfile
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -8,7 +10,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from .config import INPUT_LANGUAGE_OPTIONS
+from .config import INPUT_LANGUAGE_OPTIONS, VAD_MODEL_KEY
 from .audio_splitter import (
     AudioSplitCancelled,
     build_cut_points,
@@ -32,8 +34,16 @@ from .file_queue import (
     STATUS_TRANSCRIBING,
     STATUS_TRANSLATING,
 )
-from .gemini_translator import GeminiTranslator, TranslationCancelled, TranslationConfig, TranslationError
+from .gemini_translator import (
+    GeminiTranslator,
+    NetworkWaiter,
+    TranslationCancelled,
+    TranslationConfig,
+    TranslationError,
+)
 from .japanese_postprocess import PostprocessOptions, postprocess_japanese_segments
+from .openai_translator import OpenAICompatConfig, OpenAICompatTranslator
+from .remote_runpod import RemoteError, RemoteSession, RemoteSettings, encode_for_upload
 from .model_manager import download_model, get_download_plan, get_model_dir, is_model_ready
 from .srt_writer import build_srt_text, write_srt_text
 from .subtitle_document import load_subtitle_document, load_subtitle_document_from_text
@@ -43,6 +53,7 @@ from .transcriber import (
     VADSettings,
     build_runtime_config,
     is_cuda_runtime_error,
+    needs_whisperseg_model,
     unload_loaded_models,
 )
 from .translator_store import TranslatorSettings
@@ -74,6 +85,13 @@ class PipelineJob:
     api_keys: list[str]
     deepl_api_key: str
     enable_translation: bool = True
+    openai_api_key: str = ""
+    # 원격(Runpod) 음성 인식 설정. None이면 이 PC에서 인식한다.
+    remote: RemoteSettings | None = None
+    # 사용자가 비용 확인 창에서 본 시간당 요금(실제 Pod 요금이 이보다 많이 높으면 취소한다)
+    remote_confirmed_price: float | None = None
+    # 원격 LLM을 번역에 쓰는 방식: "primary"(LLM으로 번역) / "fallback"(Gemini 실패 시 LLM)
+    remote_llm_role: str = "primary"
 
 
 @dataclass(slots=True)
@@ -83,6 +101,7 @@ class SubtitleTranslationJob:
     translator_settings: TranslatorSettings
     api_keys: list[str]
     deepl_api_key: str
+    openai_api_key: str = ""
 
 
 @dataclass(slots=True)
@@ -101,6 +120,8 @@ class SaveTask:
     content: str
     is_primary: bool = True
     note: str = ""
+    # 저장에 성공하면 지울 중간 파일(번역이 모두 끝나 더는 필요 없는 원문 자막)
+    remove_after_save: Path | None = None
 
 
 # 프로그램 종료로 작업을 중단할 때 진행 중 단계를 빠져나오는 데 쓴다(번역기 대기 중 취소와 같은 예외).
@@ -114,6 +135,39 @@ class TranslationOutcome:
     failed: bool
 
 
+@dataclass(slots=True)
+class TranslatorChain:
+    """번역을 시도할 순서: primary(Gemini 또는 LLM 서버) -> secondary(Gemini 실패 시 LLM 서버) -> DeepL."""
+
+    primary: GeminiTranslator | None
+    secondary: GeminiTranslator | None
+    deepl: DeepLTranslator | None
+
+    @property
+    def first(self) -> GeminiTranslator | None:
+        return self.primary or self.secondary
+
+    def summaries(self) -> list[str]:
+        return [t.token_usage_summary for t in (self.primary, self.secondary) if t is not None]
+
+
+def build_openai_translator(settings: TranslatorSettings, api_key: str, log_callback) -> OpenAICompatTranslator | None:
+    if not settings.openai_base_url.strip() or not settings.openai_model.strip():
+        return None
+    return OpenAICompatTranslator(
+        OpenAICompatConfig(
+            base_url=settings.openai_base_url,
+            model=settings.openai_model,
+            api_key=api_key,
+            target_language=settings.target_language,
+            system_prompt=settings.system_prompt,
+            translation_note=settings.translation_note,
+            chunk_size=settings.chunk_size,
+        ),
+        log_callback,
+    )
+
+
 def create_translators(
     settings: TranslatorSettings,
     api_keys: list[str],
@@ -121,9 +175,10 @@ def create_translators(
     source_language: str,
     log_callback,
     cancel_check=None,
-) -> tuple[GeminiTranslator | None, DeepLTranslator | None]:
+    openai_api_key: str = "",
+) -> TranslatorChain:
     gemini_translator = None
-    if api_keys:
+    if api_keys and settings.provider != "openai":
         gemini_translator = GeminiTranslator(
             TranslationConfig(
                 keys=api_keys,
@@ -153,28 +208,58 @@ def create_translators(
             log_callback,
         )
 
-    if gemini_translator is None and deepl_translator is None:
+    llm_translator = None
+    if settings.provider == "openai" or settings.use_openai_fallback:
+        llm_translator = build_openai_translator(settings, openai_api_key, log_callback)
+        if llm_translator is None and settings.provider == "openai":
+            raise RuntimeError("LLM 서버 주소와 모델 이름이 비어 있습니다. 번역 설정 탭에서 입력하세요.")
+
+    if settings.provider == "openai":
+        chain = TranslatorChain(primary=llm_translator, secondary=None, deepl=deepl_translator)
+    else:
+        chain = TranslatorChain(primary=gemini_translator, secondary=llm_translator, deepl=deepl_translator)
+    if chain.primary is None and chain.secondary is None and chain.deepl is None:
         raise RuntimeError("번역용 Gemini API 키가 비어 있습니다. 번역 설정 탭에서 입력하세요.")
-    for translator in (gemini_translator, deepl_translator):
+    # 인터넷이 끊겼을 때 한 번역기가 기다리다 포기하면 다음 번역기도 다시 기다리지 않도록 상태를 함께 쓴다.
+    network = NetworkWaiter(log_callback)
+    for translator in (chain.primary, chain.secondary, chain.deepl):
         if translator is not None:
             translator.cancel_check = cancel_check
-    return gemini_translator, deepl_translator
+            translator.network = network
+    return chain
 
 
-def translate_records(records, gemini_translator, deepl_translator, progress_callback, file_name: str, log_callback) -> TranslationOutcome:
+def _translator_label(translator) -> str:
+    return "LLM 서버" if isinstance(translator, OpenAICompatTranslator) else "Gemini"
+
+
+def translate_records(records, chain: TranslatorChain, progress_callback, file_name: str, log_callback) -> TranslationOutcome:
     translations: dict[str, str] = {}
     gemini_aborted = False
-    if gemini_translator is not None:
+    primary = chain.primary
+    if primary is not None:
         try:
-            translations = gemini_translator.translate_lines(records, progress_callback, file_name)
+            translations = primary.translate_lines(records, progress_callback, file_name)
         except WorkerStopped:
             raise
         except Exception as exc:
             translations = dict(getattr(exc, "partial", None) or {})
             gemini_aborted = True
-            log_callback(f"{file_name} | Gemini 번역 중단 -> {str(exc) or exc.__class__.__name__}")
+            log_callback(f"{file_name} | {_translator_label(primary)} 번역 중단 -> {str(exc) or exc.__class__.__name__}")
 
     missing = [record for record in records if record.line_id not in translations]
+    if missing and chain.secondary is not None:
+        log_callback(f"{file_name} | 번역되지 않은 {len(missing)}줄을 LLM 서버({chain.secondary.compat.model})로 번역합니다.")
+        try:
+            translations.update(chain.secondary.translate_lines(missing, progress_callback, file_name))
+            gemini_aborted = False
+        except WorkerStopped:
+            raise
+        except Exception as exc:
+            translations.update(getattr(exc, "partial", None) or {})
+            log_callback(f"{file_name} | LLM 서버 번역 실패 -> {str(exc) or exc.__class__.__name__}")
+        missing = [record for record in records if record.line_id not in translations]
+    deepl_translator = chain.deepl
     if missing and deepl_translator is not None:
         log_callback(f"{file_name} | 번역되지 않은 {len(missing)}줄을 DeepL Free API로 번역합니다.")
         try:
@@ -186,7 +271,7 @@ def translate_records(records, gemini_translator, deepl_translator, progress_cal
             log_callback(f"{file_name} | DeepL 번역 실패 -> {str(exc) or exc.__class__.__name__}")
         missing = [record for record in records if record.line_id not in translations]
 
-    failed = bool(missing) and (gemini_aborted or gemini_translator is None or not translations)
+    failed = bool(missing) and (gemini_aborted or chain.first is None or not translations)
     return TranslationOutcome(translations=translations, missing_count=len(missing), failed=failed)
 
 
@@ -330,31 +415,118 @@ class PipelineWorker(QThread):
         return True
 
     def run(self) -> None:
+        self._remote_session: RemoteSession | None = None
+        try:
+            self._run()
+        finally:
+            if self._remote_session is not None:
+                self.stage_changed.emit("정리", "Runpod Pod 삭제")
+                self._remote_session.close()
+                self._remote_session = None
+
+    def _start_remote(self) -> None:
+        remote = self.job.remote
+        assert remote is not None
+        network = NetworkWaiter(self.log_message.emit)
+        session = RemoteSession(
+            remote,
+            self.log_message.emit,
+            network=network,
+            cancel_check=lambda: self._stop_requested or self.isInterruptionRequested(),
+        )
+        self._remote_session = session
+        self.stage_changed.emit("원격 준비", "Runpod 연결")
+
+        def report(message: str) -> None:
+            self.stage_changed.emit("원격 준비", message)
+            self.log_message.emit(message)
+
+        session.start(report, self.job.remote_confirmed_price)
+
+    def _remote_translator_settings(self) -> tuple[TranslatorSettings, str]:
+        """원격 LLM을 쓰면 번역 설정을 그 주소로 바꾼다(키는 워커 토큰)."""
+        settings = self.job.translator_settings
+        session = self._remote_session
+        if session is None or session.worker is None or self.job.remote is None or self.job.remote.llm_choice == "none":
+            return settings, self.job.openai_api_key
+        base = session.worker.llm_base_url
+        role_primary = self.job.remote_llm_role == "primary" or not self.job.api_keys
+        updated = dataclasses.replace(
+            settings,
+            provider="openai" if role_primary else settings.provider,
+            use_openai_fallback=not role_primary,
+            openai_base_url=base,
+            openai_model=self.job.remote.llm_choice,
+        )
+        return updated, session.worker.token
+
+    def _transcribe_remote(self, source_path: Path, language_code: str | None):
+        session = self._remote_session
+        assert session is not None and session.worker is not None
+        vad = self.job.vad_settings
+        options = {
+            "model_key": self.job.model_key,
+            "language": language_code,
+            "device": "cuda",
+            "compute_type": "auto",
+            "vad": {name: getattr(vad, name) for name in vad.__slots__},
+        }
+        with tempfile.TemporaryDirectory(prefix="dsm-remote-") as tmp:
+            upload = Path(tmp) / "audio.ogg"
+            self.stage_changed.emit("자막 생성", "원격 업로드용 변환")
+            encode_for_upload(source_path, upload)
+            self.stage_changed.emit("자막 생성", "원격 음성 인식")
+            return session.worker.transcribe(
+                upload,
+                options,
+                self._make_stage_progress_callback(),
+                self.log_message.emit,
+                lambda: self._stop_requested or self.isInterruptionRequested(),
+            )
+
+    def _run(self) -> None:
         try:
             self._start_save_worker()
-            if self.job.runtime_device == "cuda":
+            remote_mode = self.job.remote is not None
+            if remote_mode:
+                self._start_remote()
+            elif self.job.runtime_device == "cuda":
                 self.stage_changed.emit("환경 준비", "CUDA runtime 확인")
                 ensure_cuda_runtime(self._report_runtime_progress, self.log_message.emit)
+
+            if not remote_mode and needs_whisperseg_model(self.job.model_key, self.job.vad_settings) and not is_model_ready(
+                model_key=VAD_MODEL_KEY
+            ):
+                # ASMR VAD는 처음 쓸 때 한 번만 받는다(약 120MB).
+                self.stage_changed.emit("환경 준비", "ASMR VAD(WhisperSeg) 모델 다운로드")
+                download_model(VAD_MODEL_KEY, self._report_vad_model_progress, self.log_message.emit)
 
             if self.job.enable_enhanced_postprocess:
                 self.stage_changed.emit("환경 준비", "강화 후처리 사전 확인")
                 ensure_dictionary_pack(self._report_dictionary_progress, self.log_message.emit)
 
-            gemini_translator = None
-            deepl_translator = None
+            chain = None
             if self.job.enable_translation:
-                gemini_translator, deepl_translator = create_translators(
-                    self.job.translator_settings,
+                translator_settings, openai_key = self._remote_translator_settings()
+                chain = create_translators(
+                    translator_settings,
                     self.job.api_keys,
                     self.job.deepl_api_key,
                     self.job.source_language,
                     self.log_message.emit,
                     lambda: self._stop_requested or self.isInterruptionRequested(),
+                    openai_key,
                 )
+            first_translator = chain.first if chain is not None else None
 
-            runtime_config = build_runtime_config(self.job.runtime_device, self.job.runtime_tuning)
-            engine = TranscriptionEngine(runtime_config, self.job.model_key)
-            self.log_message.emit(f"실행 장치: {runtime_config.label}")
+            if remote_mode:
+                runtime_config = None
+                engine = None
+                self.log_message.emit("실행 장치: Runpod 원격 GPU")
+            else:
+                runtime_config = build_runtime_config(self.job.runtime_device, self.job.runtime_tuning)
+                engine = TranscriptionEngine(runtime_config, self.job.model_key)
+                self.log_message.emit(f"실행 장치: {runtime_config.label}")
 
             postprocess_options = PostprocessOptions(
                 enabled=self.job.enable_postprocess,
@@ -375,9 +547,9 @@ class PipelineWorker(QThread):
                 output_path = source_path.with_suffix(".srt")
                 self.file_started.emit(index, total, str(source_path))
                 self.stage_progress_changed.emit(0, 0.0, 0.0)
-                if gemini_translator is not None:
+                if first_translator is not None:
                     self.translation_progress_changed.emit(
-                        0, 0, gemini_translator.current_key_display, "", gemini_translator.error_count
+                        0, 0, first_translator.current_key_display, "", first_translator.error_count
                     )
 
                 try:
@@ -403,15 +575,19 @@ class PipelineWorker(QThread):
                     else:
                         self.item_status_changed.emit(source_str, STATUS_TRANSCRIBING, "")
                         self.stage_changed.emit("자막 생성", "음성 인식")
+                        remote_language = None
                         try:
-                            segments = engine.transcribe_file(
-                                source_path,
-                                self._make_stage_progress_callback(),
-                                language_code=language_code,
-                                vad_settings=self.job.vad_settings,
-                            )
+                            if remote_mode:
+                                segments, remote_language = self._transcribe_remote(source_path, language_code)
+                            else:
+                                segments = engine.transcribe_file(
+                                    source_path,
+                                    self._make_stage_progress_callback(),
+                                    language_code=language_code,
+                                    vad_settings=self.job.vad_settings,
+                                )
                         except Exception as exc:
-                            if runtime_config.device == "cuda" and is_cuda_runtime_error(str(exc)):
+                            if not remote_mode and runtime_config.device == "cuda" and is_cuda_runtime_error(str(exc)):
                                 if "out of memory" in str(exc).lower():
                                     self.log_message.emit("GPU 메모리가 부족하여 CPU로 자동 전환합니다.")
                                 else:
@@ -444,7 +620,8 @@ class PipelineWorker(QThread):
                             segments = postprocess_japanese_segments(segments, postprocess_options)
 
                         subtitle_text = build_srt_text(segments)
-                        source_language = engine.last_detected_language or language_code or "source"
+                        detected = remote_language if remote_mode else engine.last_detected_language
+                        source_language = detected or language_code or "source"
                         original_output_path = build_translated_subtitle_output_path(output_path, source_language)
 
                     if not subtitle_text.strip():
@@ -458,6 +635,9 @@ class PipelineWorker(QThread):
                         self.stage_progress_changed.emit(100, 0.0, 0.0)
                         continue
 
+                    # 번역이 끝나 지워도 되는 원문 자막은 이번에 만든 것이나 재사용한 것뿐이다. 자동 감지 언어가 출력
+                    # 언어와 같아(예: 한국어 음성 -> ko) 원래 있던 a.ko.srt와 이름이 겹치면 그 파일은 건드리지 않는다.
+                    owns_original = existing_original is not None or not original_output_path.exists()
                     if existing_original is None and not original_output_path.exists():
                         # 번역 도중 예기치 못한 오류가 나도 음성 인식 결과는 남도록 먼저 저장한다.
                         self._enqueue_save(
@@ -471,12 +651,14 @@ class PipelineWorker(QThread):
 
                     self.item_status_changed.emit(source_str, STATUS_TRANSLATING, "")
                     self.stage_changed.emit("번역", "자막 번역")
+                    if remote_mode and self.job.remote.llm_choice != "none" and self._remote_session is not None:
+                        # 원격 LLM은 모델을 받고 올리는 데 몇 분 걸릴 수 있어 처음 번역할 때 준비를 기다린다.
+                        self._remote_session.wait_llm(lambda m: self.stage_changed.emit("번역", m))
                     document = load_subtitle_document_from_text(".srt", subtitle_text)
                     records = document.get_translatable_records()
                     outcome = translate_records(
                         records,
-                        gemini_translator,
-                        deepl_translator,
+                        chain,
                         self._make_translation_progress_callback(),
                         source_path.name,
                         self.log_message.emit,
@@ -501,6 +683,8 @@ class PipelineWorker(QThread):
                             output_path=output_path,
                             content=document.render() + "\n",
                             note=note,
+                            # 한 줄이라도 번역에 실패했으면 원문 자막을 남겨 둔다(직접 확인·재번역용).
+                            remove_after_save=None if outcome.missing_count or not owns_original else original_output_path,
                         )
                     )
                     self.log_message.emit(f"{source_path} | 저장 큐 등록 -> {output_path}")
@@ -517,7 +701,7 @@ class PipelineWorker(QThread):
                     self.log_message.emit(f"{source_path} | 실패 -> {message}")
                     self.stage_changed.emit("실패", message)
                 finally:
-                    if self.job.runtime_tuning.memory_profile == "strict":
+                    if not remote_mode and self.job.runtime_tuning.memory_profile == "strict":
                         unloaded = unload_loaded_models(self.job.model_key)
                         if unloaded > 0:
                             self.log_message.emit("강한 절약 모드로 현재 파일 처리 후 모델을 메모리에서 해제했습니다.")
@@ -528,8 +712,8 @@ class PipelineWorker(QThread):
                 unloaded = unload_loaded_models(self.job.model_key)
                 if unloaded > 0:
                     self.log_message.emit(f"작업 완료 후 모델 {unloaded}개를 메모리에서 자동 해제했습니다.")
-            if gemini_translator is not None:
-                self.log_message.emit(gemini_translator.token_usage_summary)
+            for summary in chain.summaries() if chain is not None else []:
+                self.log_message.emit(summary)
             self.summary_ready.emit(self._success_count, self._failure_count, self._skipped_count)
         except Exception as exc:
             self._wait_for_save_completion()
@@ -581,6 +765,8 @@ class PipelineWorker(QThread):
                     continue
                 with self._counter_lock:
                     self._success_count += 1
+                if task.remove_after_save is not None:
+                    self._remove_intermediate(task.source_path, task.remove_after_save)
                 done_message = f"{task.output_path} | {task.note}" if task.note else str(task.output_path)
                 self.item_status_changed.emit(task.source_path, STATUS_DONE, done_message)
                 self.log_message.emit(f"{task.source_path} | 완료 -> {done_message}")
@@ -595,6 +781,14 @@ class PipelineWorker(QThread):
                 self.log_message.emit(f"{task.source_path} | 저장 실패 -> {message}")
             finally:
                 self._save_queue.task_done()
+
+    def _remove_intermediate(self, source_path: str, path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log_message.emit(f"{source_path} | 원문 자막 정리 실패 (파일은 남아 있음) -> {path}: {exc}")
+            return
+        self.log_message.emit(f"{source_path} | 번역 완료로 원문 자막 삭제 -> {path}")
 
     def _next_source(self) -> tuple[str | None, int, int]:
         with self._condition:
@@ -668,6 +862,16 @@ class PipelineWorker(QThread):
         file_total: int,
     ) -> None:
         self._emit_prep_progress("CUDA runtime", downloaded_bytes, total_bytes, filename, file_downloaded, file_total)
+
+    def _report_vad_model_progress(
+        self,
+        downloaded_bytes: int,
+        total_bytes: int,
+        filename: str,
+        file_downloaded: int,
+        file_total: int,
+    ) -> None:
+        self._emit_prep_progress("ASMR VAD model", downloaded_bytes, total_bytes, filename, file_downloaded, file_total)
 
     def _report_dictionary_progress(
         self,
@@ -782,14 +986,16 @@ class SubtitleTranslationWorker(QThread):
 
     def run(self) -> None:
         try:
-            gemini_translator, deepl_translator = create_translators(
+            chain = create_translators(
                 self.job.translator_settings,
                 self.job.api_keys,
                 self.job.deepl_api_key,
                 self.job.source_language,
                 self.log_message.emit,
                 self.isInterruptionRequested,
+                self.job.openai_api_key,
             )
+            first_translator = chain.first
 
             while True:
                 source_str, index, total = self._next_source()
@@ -798,9 +1004,9 @@ class SubtitleTranslationWorker(QThread):
                 source_path = Path(source_str)
                 output_path = build_translated_subtitle_output_path(source_path, self.job.translator_settings.target_language)
                 self.file_started.emit(index, total, source_str)
-                if gemini_translator is not None:
+                if first_translator is not None:
                     self.translation_progress_changed.emit(
-                        0, 0, gemini_translator.current_key_display, "", gemini_translator.error_count
+                        0, 0, first_translator.current_key_display, "", first_translator.error_count
                     )
 
                 try:
@@ -828,8 +1034,7 @@ class SubtitleTranslationWorker(QThread):
                     records = document.get_translatable_records()
                     outcome = translate_records(
                         records,
-                        gemini_translator,
-                        deepl_translator,
+                        chain,
                         self._progress_callback,
                         source_path.name,
                         self.log_message.emit,
@@ -865,8 +1070,8 @@ class SubtitleTranslationWorker(QThread):
                         total = self._processed + len(self._pending_paths)
                     self.queue_progress_changed.emit(self._processed, total)
 
-            if gemini_translator is not None:
-                self.log_message.emit(gemini_translator.token_usage_summary)
+            for summary in chain.summaries():
+                self.log_message.emit(summary)
             self.summary_ready.emit(self._success_count, self._failure_count, self._skipped_count)
         except Exception as exc:
             self.failed.emit(str(exc) or exc.__class__.__name__)

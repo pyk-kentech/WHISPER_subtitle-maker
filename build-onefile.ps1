@@ -48,7 +48,10 @@ $pyinstallerArgs = @(
   "--collect-all", "tokenizers",
   "--collect-all", "huggingface_hub",
   "--collect-all", "google.genai",
-  "--collect-all", "dotenv"
+  "--collect-all", "dotenv",
+  "--collect-all", "onnxruntime",
+  # Runpod 원격 실행은 앱 코드(.py)를 원격 Pod로 올리므로 소스를 함께 넣는다.
+  "--add-data", "$root\app\*.py;remote_bundle\app"
 )
 
 if ($iconArgs.Count -gt 0) {

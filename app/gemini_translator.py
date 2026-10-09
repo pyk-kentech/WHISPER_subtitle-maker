@@ -3,11 +3,13 @@
 import html
 import random
 import re
+import socket
 import time
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Callable
+from typing import Callable, TypeVar
+from urllib import error as urllib_error
 
 import httpx
 from google import genai
@@ -17,6 +19,8 @@ from google.genai import types as genai_types
 from .config import (
     DEFAULT_TRANSLATION_MODELS,
     DEFAULT_TRANSLATION_REQUEST_DELAY_JITTER_SECONDS,
+    NETWORK_OUTAGE_MAX_WAIT_SECONDS,
+    NETWORK_OUTAGE_RETRY_SECONDS,
     TRANSLATION_CONTEXT_LINES,
     TRANSLATION_ECHO_MIN_SIMILARITY,
 )
@@ -47,7 +51,8 @@ _SAFETY_SETTINGS = [
 ]
 _BLOCKED_FINISH_REASONS = {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"}
 
-_LINE_PATTERN = re.compile(r'<p id="([^"]+)">(.*?)</p>', re.DOTALL)
+# 모델이 </p>를 빠뜨려도 다음 줄을 삼키지 않도록 다음 <p id=나 </main>에서도 끊는다.
+_LINE_PATTERN = re.compile(r'<p id="([^"]+)">(.*?)(?=</p>|<p id="|</main>|\Z)', re.DOTALL)
 _ECHO_PATTERN = re.compile(r"\s*<o>(.*?)</o>(.*)\Z", re.DOTALL)
 
 TARGET_LANGUAGE_LABELS = {
@@ -89,6 +94,101 @@ class TranslationUnavailableError(TranslationError):
     """키·모델·할당량 문제라 청크를 쪼개 다시 보내도 해결되지 않는 실패."""
 
 
+class NetworkUnavailableError(TranslationUnavailableError):
+    """인터넷 연결이 끊긴 채 기다려도 돌아오지 않아 번역을 멈출 때 쓴다."""
+
+
+T = TypeVar("T")
+
+# DNS 조회 실패·경로 없음 등 "서버에 닿지도 못한" 상태를 나타내는 문구(Windows/Linux/macOS).
+_NETWORK_DOWN_TOKENS = (
+    "getaddrinfo failed",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "nodename nor servname",
+    "no address associated with hostname",
+    "network is unreachable",
+    "no route to host",
+)
+
+
+def is_network_down_error(exc: BaseException) -> bool:
+    """키를 바꿔도 소용없는 연결 실패(인터넷 끊김)인지 예외 체인을 따라가며 확인한다."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (httpx.ConnectError, httpx.ConnectTimeout, socket.gaierror)):
+            return True
+        if isinstance(current, urllib_error.URLError) and isinstance(
+            current.reason, (socket.gaierror, ConnectionRefusedError, TimeoutError)
+        ):
+            return True
+        lowered = str(current).lower()
+        if any(token in lowered for token in _NETWORK_DOWN_TOKENS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+class NetworkWaiter:
+    """인터넷이 끊기면 키·모델을 돌려 가며 헛도는 대신 연결이 돌아올 때까지 같은 요청을 다시 보낸다.
+    Gemini와 DeepL이 한 객체를 같이 써서, 한 번 기다리다 포기한 뒤에는 연결이 돌아오기 전까지 곧바로 포기한다
+    (음성 인식 등 나머지 작업이 막히지 않도록)."""
+
+    def __init__(
+        self,
+        log_callback: LogCallback,
+        max_wait_seconds: float = NETWORK_OUTAGE_MAX_WAIT_SECONDS,
+        retry_seconds: tuple[float, ...] = NETWORK_OUTAGE_RETRY_SECONDS,
+    ) -> None:
+        self.log_callback = log_callback
+        self.max_wait_seconds = max_wait_seconds
+        self.retry_seconds = retry_seconds
+        self._outage_started: float | None = None
+        self._gave_up = False
+
+    def run(self, request: Callable[[], T], sleep: Callable[[float], None]) -> T:
+        attempt = 0
+        while True:
+            try:
+                result = request()
+            except Exception as exc:
+                if not is_network_down_error(exc):
+                    # 서버까지는 닿았다는 뜻이므로 연결은 살아 있다.
+                    self._mark_online()
+                    raise
+                if self._gave_up:
+                    raise NetworkUnavailableError(f"인터넷 연결 없음: {exc}") from exc
+                now = time.monotonic()
+                if self._outage_started is None:
+                    self._outage_started = now
+                    self.log_callback(
+                        f"인터넷 연결이 끊겼습니다 ({exc}). 키·모델은 그대로 두고 최대 "
+                        f"{self.max_wait_seconds / 60:.0f}분 동안 연결을 기다립니다."
+                    )
+                elapsed = now - self._outage_started
+                if elapsed >= self.max_wait_seconds:
+                    self._gave_up = True
+                    raise NetworkUnavailableError(
+                        f"인터넷 연결이 {elapsed / 60:.0f}분 넘게 끊겨 있어 번역을 멈춥니다: {exc}"
+                    ) from exc
+                wait = self.retry_seconds[min(attempt, len(self.retry_seconds) - 1)]
+                wait = min(wait, self.max_wait_seconds - elapsed)
+                attempt += 1
+                self.log_callback(f"연결 대기 중... {wait:.0f}초 후 다시 시도 (끊긴 지 {elapsed:.0f}초)")
+                sleep(wait)
+                continue
+            self._mark_online()
+            return result
+
+    def _mark_online(self) -> None:
+        if self._outage_started is not None or self._gave_up:
+            self.log_callback("인터넷 연결이 돌아왔습니다. 번역을 이어갑니다.")
+        self._outage_started = None
+        self._gave_up = False
+
+
 @dataclass(slots=True)
 class TranslationConfig:
     keys: list[str]
@@ -123,6 +223,7 @@ class GeminiTranslator:
         self.token_usage = {"prompt": 0, "output": 0, "thinking": 0}
         self._clients: dict[str, genai.Client] = {}
         self.cancel_check: Callable[[], bool] | None = None
+        self.network = NetworkWaiter(log_callback)
         self._thinking_levels: dict[str, str | None] = {}
         # 사용자가 정한 요청 간격은 최소값으로 지킨다(무료 티어 분당 한도 보호).
         self._base_delay_seconds = max(self.config.min_adaptive_delay_seconds, float(self.config.request_delay_seconds))
@@ -294,10 +395,17 @@ class GeminiTranslator:
                     )
                     try:
                         self._sleep_for_request_spacing()
-                        response_text = self._request_translation(api_key, model_name, system_prompt, user_prompt)
+                        response_text = self.network.run(
+                            lambda: self._request_translation(api_key, model_name, system_prompt, user_prompt),
+                            self._sleep,
+                        )
                         self._last_request_monotonic = time.monotonic()
                         self._on_request_success()
                         return self._parse_response(response_text, chunk, file_name)
+                    except NetworkUnavailableError:
+                        # 연결이 끊긴 동안은 다른 키·모델도 똑같이 실패하므로 돌려 보지 않는다.
+                        self._last_request_monotonic = time.monotonic()
+                        raise
                     except (SafetyBlockedError, ResponseFormatError) as exc:
                         # 내용 문제는 키를 바꿔도 같으므로, 여러 줄이면 바로 쪼개서 문제 줄을 찾고
                         # 한 줄까지 좁혀졌을 때만 다른 모델로 한 번씩 시도한다.
@@ -489,7 +597,7 @@ class GeminiTranslator:
                     rejected.append(record.line_id)
                     continue
                 body = match.group(2)
-            text = html.unescape(body.strip())
+            text = _strip_echo_leftovers(html.unescape(body.strip()))
             if not text and _normalize_for_echo(record.text):
                 rejected.append(record.line_id)
                 continue
@@ -557,6 +665,16 @@ def _is_auth_error(message: str) -> bool:
 def _is_model_unavailable_error(message: str) -> bool:
     lowered = message.lower()
     return "404" in lowered or "not found" in lowered or "not supported for generatecontent" in lowered
+
+
+_LEADING_ECHO = re.compile(r"\A\s*<o>.*?</o>", re.DOTALL)
+
+
+def _strip_echo_leftovers(text: str) -> str:
+    """모델이 <o>를 두 번 쓰는 등(<o><o>원문</o>번역) 되풀이가 번역 앞에 남으면 지운다. 남은 <o>, </o> 태그도 지운다."""
+    while _LEADING_ECHO.match(text):
+        text = _LEADING_ECHO.sub("", text, count=1)
+    return text.replace("<o>", "").replace("</o>", "").strip()
 
 
 def _normalize_for_echo(text: str) -> str:
