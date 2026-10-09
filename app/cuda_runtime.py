@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ctypes
+import fnmatch
 import hashlib
 import json
 import os
+import platform
+import sys
 from pathlib import Path
 from typing import Callable
 import urllib.request
@@ -23,11 +27,15 @@ CUDA_PACKAGES = (
     "nvidia-cudnn-cu12",
     "nvidia-cuda-nvrtc-cu12",
 )
-REQUIRED_DLL_PREFIXES = (
-    "cublas64_12",
-    "cudart64_12",
-    "cudnn64_9",
-)
+_IS_WINDOWS = sys.platform == "win32"
+# 휠 안에서 꺼낼 라이브러리 파일과, 준비 완료로 볼 필수 라이브러리(Windows는 DLL, 리눅스는 .so).
+if _IS_WINDOWS:
+    REQUIRED_LIBRARY_PATTERNS = ("cublas64_12*.dll", "cudart64_12*.dll", "cudnn64_9*.dll")
+    SYSTEM_LIBRARY_NAMES: tuple[str, ...] = ()
+else:
+    REQUIRED_LIBRARY_PATTERNS = ("libcublas.so.12*", "libcudart.so.12*", "libcudnn.so.9*")
+    # 시스템에 CUDA 12·cuDNN 9가 깔려 있으면 따로 받지 않고 그것을 쓴다.
+    SYSTEM_LIBRARY_NAMES = ("libcublas.so.12", "libcudnn.so.9")
 PACKAGE_MAJOR_VERSIONS = {
     "nvidia-cudnn-cu12": 9,
 }
@@ -65,17 +73,73 @@ def _write_manifest(data: dict[str, object]) -> None:
     manifest_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _find_dll_by_prefix(prefix: str) -> Path | None:
+_PRELOADED_LIBRARIES: set[str] = set()
+
+
+def _is_library_file(name: str) -> bool:
+    lowered = name.lower()
+    if _IS_WINDOWS:
+        return lowered.endswith(".dll")
+    return ".so" in lowered and fnmatch.fnmatch(lowered, "*.so*")
+
+
+def _find_library(pattern: str) -> Path | None:
     bin_dir = get_runtime_bin_dir()
     if not bin_dir.is_dir():
         return None
-    for path in bin_dir.glob(f"{prefix}*.dll"):
+    for path in bin_dir.glob(pattern):
         return path
     return None
 
 
+def is_system_cuda_available() -> bool:
+    if not SYSTEM_LIBRARY_NAMES:
+        return False
+    try:
+        for name in SYSTEM_LIBRARY_NAMES:
+            ctypes.CDLL(name)
+    except OSError:
+        return False
+    return True
+
+
 def is_cuda_runtime_ready() -> bool:
-    return all(_find_dll_by_prefix(prefix) is not None for prefix in REQUIRED_DLL_PREFIXES)
+    if all(_find_library(pattern) is not None for pattern in REQUIRED_LIBRARY_PATTERNS):
+        return True
+    return is_system_cuda_available()
+
+
+def find_missing_cuda_libraries() -> list[str]:
+    """CTranslate2가 실제로 불러올 CUDA 라이브러리 중 로드되지 않는 것의 이름을 돌려준다."""
+    names = ("cublas64_12.dll",) if _IS_WINDOWS else ("libcublas.so.12", "libcudnn.so.9")
+    loader = getattr(ctypes, "WinDLL", ctypes.CDLL) if _IS_WINDOWS else ctypes.CDLL
+    missing: list[str] = []
+    for name in names:
+        try:
+            loader(name)
+        except OSError:
+            missing.append(name)
+    return missing
+
+
+def _preload_libraries(bin_dir: Path) -> None:
+    # 리눅스는 실행 중에 LD_LIBRARY_PATH를 바꿔도 dlopen이 보지 않는다. 받은 .so를 RTLD_GLOBAL로 미리 올려 두면
+    # CTranslate2가 같은 이름(soname)으로 찾을 때 이미 로드된 것을 쓴다. 의존 순서를 몰라도 되도록 될 때까지 반복한다.
+    pending = sorted(
+        path for path in bin_dir.iterdir() if _is_library_file(path.name) and str(path) not in _PRELOADED_LIBRARIES
+    )
+    while pending:
+        failed: list[Path] = []
+        for path in pending:
+            try:
+                ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                failed.append(path)
+                continue
+            _PRELOADED_LIBRARIES.add(str(path))
+        if len(failed) == len(pending):
+            return
+        pending = failed
 
 
 def add_cuda_runtime_to_path() -> Path | None:
@@ -95,6 +159,8 @@ def add_cuda_runtime_to_path() -> Path | None:
             add_dll_directory(bin_dir_str)
         except OSError:
             pass
+    if not _IS_WINDOWS:
+        _preload_libraries(bin_dir)
     return bin_dir
 
 
@@ -123,9 +189,17 @@ def _get_package_metadata(package_name: str) -> tuple[str, str, str, str]:
     version = _select_version(package_name, metadata)
     for file_info in metadata["releases"][version]:
         filename = str(file_info["filename"])
-        if "win_amd64" in filename and filename.endswith(".whl"):
+        if filename.endswith(".whl") and _wheel_matches_platform(filename):
             return version, str(file_info["url"]), filename, str(file_info["digests"]["sha256"])
-    raise RuntimeError(f"Windows wheel not found for {package_name}")
+    raise RuntimeError(f"{sys.platform}/{platform.machine()}용 wheel을 찾지 못했습니다: {package_name}")
+
+
+def _wheel_matches_platform(filename: str) -> bool:
+    if _IS_WINDOWS:
+        return "win_amd64" in filename
+    machine = platform.machine().lower()
+    arch = "aarch64" if machine in {"aarch64", "arm64"} else "x86_64"
+    return "manylinux" in filename and arch in filename
 
 
 def _sha256_of(path: Path) -> str:
@@ -167,7 +241,7 @@ def _download_file(
     partial_path.replace(destination)
 
 
-def _extract_dlls(wheel_path: Path, status_callback: StatusCallback) -> int:
+def _extract_libraries(wheel_path: Path, status_callback: StatusCallback) -> int:
     bin_dir = get_runtime_bin_dir()
     bin_dir.mkdir(parents=True, exist_ok=True)
     extracted_count = 0
@@ -176,7 +250,7 @@ def _extract_dlls(wheel_path: Path, status_callback: StatusCallback) -> int:
         for member in archive.infolist():
             if member.is_dir():
                 continue
-            if not member.filename.lower().endswith(".dll"):
+            if not _is_library_file(Path(member.filename).name):
                 continue
 
             target_path = bin_dir / Path(member.filename).name
@@ -186,7 +260,7 @@ def _extract_dlls(wheel_path: Path, status_callback: StatusCallback) -> int:
             partial_path.replace(target_path)
             extracted_count += 1
 
-    status_callback(f"CUDA DLL 추출 완료: {wheel_path.name} ({extracted_count}개)")
+    status_callback(f"CUDA 라이브러리 추출 완료: {wheel_path.name} ({extracted_count}개)")
     return extracted_count
 
 
@@ -198,6 +272,10 @@ def ensure_cuda_runtime(
         raise RuntimeError("CUDA GPU를 찾지 못했습니다.")
 
     add_cuda_runtime_to_path()
+    if is_system_cuda_available():
+        progress_callback(1, 1, "", 1, 1)
+        status_callback("시스템에 설치된 CUDA 12 / cuDNN 9 라이브러리를 사용합니다.")
+        return get_runtime_bin_dir()
     if is_cuda_runtime_ready():
         progress_callback(1, 1, "", 1, 1)
         status_callback("CUDA 런타임 캐시가 이미 준비되어 있습니다.")
@@ -229,13 +307,13 @@ def ensure_cuda_runtime(
 
         if installed_versions.get(package_name) != version or not is_cuda_runtime_ready():
             status_callback(f"CUDA 런타임 설치 중: {package_name} {version}")
-            _extract_dlls(wheel_path, status_callback)
+            _extract_libraries(wheel_path, status_callback)
 
     _write_manifest({"packages": package_versions})
     add_cuda_runtime_to_path()
 
     if not is_cuda_runtime_ready():
-        raise RuntimeError("CUDA 런타임 다운로드 후에도 필수 DLL이 준비되지 않았습니다.")
+        raise RuntimeError("CUDA 런타임 다운로드 후에도 필수 라이브러리가 준비되지 않았습니다.")
 
     status_callback(f"CUDA 런타임 준비 완료: {get_runtime_bin_dir()}")
     return get_runtime_bin_dir()

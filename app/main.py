@@ -5,12 +5,14 @@ import logging
 import sys
 import traceback
 
+from PySide6.QtCore import QLockFile
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .app_logging import get_logger, setup_logging
-from .config import APP_NAME, get_font_paths, get_log_dir
+from .config import APP_NAME, get_app_data_dir, get_font_paths, get_log_dir
 from .cuda_runtime import add_cuda_runtime_to_path
+from .theme import apply_theme
 from .ui import MainWindow
 
 
@@ -49,6 +51,17 @@ def _set_windows_app_id() -> None:
 def _acquire_single_instance() -> bool:
     global _SINGLE_INSTANCE_MUTEX
     if sys.platform != "win32":
+        # 리눅스 등: 앱 데이터 폴더의 잠금 파일로 확인한다(프로세스가 죽으면 Qt가 오래된 잠금을 알아서 정리).
+        try:
+            lock_dir = get_app_data_dir()
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock = QLockFile(str(lock_dir / "instance.lock"))
+            lock.setStaleLockTime(0)
+            if not lock.tryLock(100):
+                return False
+            _SINGLE_INSTANCE_MUTEX = lock
+        except Exception:
+            pass
         return True
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -87,6 +100,7 @@ def main() -> int:
     app.setOrganizationName("Codex")
     app.setQuitOnLastWindowClosed(False)
     _apply_bundled_font(app)
+    apply_theme(app)
     if not _acquire_single_instance():
         QMessageBox.information(None, APP_NAME, "이미 실행 중입니다.\n기존 창이나 트레이 아이콘을 확인해 주세요.")
         return 0

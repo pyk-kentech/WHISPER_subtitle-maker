@@ -1,0 +1,10 @@
+# 채점·VAD 비교용 별도 venv (앱 .venv와 섞지 않음): python -m venv eval/venv && eval/venv/Scripts/python -m pip install -r eval/requirements-eval.txt
+pypdf
+rapidfuzz
+sudachipy
+sudachidict_core
+onnxruntime
+transformers
+huggingface_hub
+av
+numpy

@@ -4,11 +4,12 @@ from datetime import datetime
 import dataclasses
 import logging
 import subprocess
+import sys
 
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -51,15 +52,24 @@ from .config import (
     APP_NAME,
     DEFAULT_INPUT_LANGUAGE,
     DEFAULT_MODEL_KEY,
+    DEFAULT_SEGMENTATION,
+    DEFAULT_VAD_BACKEND,
     DEFAULT_VAD_ENABLED,
     DEFAULT_VAD_MIN_SILENCE_MS,
     DEFAULT_VAD_SPEECH_PAD_MS,
     INPUT_LANGUAGE_OPTIONS,
     MODEL_PRESETS,
     OUTPUT_LANGUAGE_OPTIONS,
+    SEGMENTATION_OPTIONS,
+    TRANSLATION_PROVIDER_OPTIONS,
+    VAD_BACKEND_OPTIONS,
+    WHISPERSEG_DEFAULT_MIN_SILENCE_MS,
+    get_app_data_dir,
     get_preferred_icon_path,
 )
 from .app_logging import get_logger, set_ui_log_callback
+from . import theme
+from .theme import set_dynamic_property
 from .audio_splitter import (
     DEFAULT_SILENCE_SEARCH_SECONDS,
     SPLIT_SUPPORTED_EXTENSIONS,
@@ -84,8 +94,28 @@ from .file_queue import (
     normalize_input_files,
     normalize_translation_files,
 )
-from .credential_store import CredentialStoreError
-from .model_manager import get_model_dir, get_model_label, is_model_ready
+from .credential_store import CredentialStoreError, load_secret, save_secret, delete_secret
+from .openai_translator import check_openai_endpoint
+from .remote_runpod import (
+    GPU_CHOICES,
+    LLM_CHOICES,
+    RemoteError,
+    RemoteSettings,
+    RunpodApi,
+    find_leftover_pods,
+    load_remote_settings,
+    prepare_cost_confirmation,
+    probe_audio_seconds,
+    save_remote_settings,
+)
+from .model_manager import (
+    get_model_dir,
+    get_model_label,
+    get_model_languages,
+    get_model_note,
+    is_model_ready,
+    model_requires_vad,
+)
 from .transcriber import (
     RuntimeTuningOptions,
     VADSettings,
@@ -94,6 +124,7 @@ from .transcriber import (
     get_available_runtime_choices,
     get_default_runtime_choice,
     get_default_cpu_threads,
+    get_default_model_key,
     get_memory_profile_choices,
     get_max_worker_count,
     unload_loaded_models,
@@ -102,11 +133,22 @@ from .translator_store import (
     TranslatorSettings,
     load_api_keys,
     load_deepl_api_key,
+    load_openai_api_key,
+    load_runpod_api_key,
     load_translator_settings,
     save_api_keys,
     save_deepl_api_key,
+    save_openai_api_key,
+    save_runpod_api_key,
     save_translator_settings,
 )
+
+REMOTE_WORKER_TOKEN_CREDENTIAL_NAME = "DongeumSubMaker/RemoteWorkerToken"
+EXECUTION_OPTIONS = [("local", "이 PC"), ("runpod", "Runpod GPU (원격)")]
+
+
+def get_remote_settings_path() -> Path:
+    return get_app_data_dir() / "remote-settings.json"
 from .workers import (
     AudioSplitJob,
     AudioSplitWorker,
@@ -120,53 +162,13 @@ from .workers import (
 
 # --windowed 빌드에서 shutdown 명령을 실행할 때 콘솔 창이 깜빡이지 않게 한다(Windows 전용 플래그).
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-GREEN_BAR_STYLE = """
-QProgressBar {
-    border: 1px solid #9bb49f;
-    border-radius: 6px;
-    background: #eef3ef;
-    text-align: center;
-}
-QProgressBar::chunk {
-    background-color: #2f9e44;
-    border-radius: 5px;
-}
-"""
-
-DROP_AREA_BASE_STYLE = (
-    "#dropArea {"
-    "border: 2px dashed #6a7b8c;"
-    "border-radius: 10px;"
-    "background: #f5f8fb;"
-    "}"
-)
-
-DROP_AREA_ACTIVE_STYLE = (
-    "#dropArea {"
-    "border: 2px solid #2f9e44;"
-    "border-radius: 10px;"
-    "background: #eaf7ee;"
-    "}"
-)
-
-DROP_TABLE_BASE_STYLE = (
-    "QTableWidget {"
-    "border: 1px solid #c9d4df;"
-    "border-radius: 8px;"
-    "background: #ffffff;"
-    "gridline-color: #dde5ee;"
-    "}"
-)
-
-DROP_TABLE_ACTIVE_STYLE = (
-    "QTableWidget {"
-    "border: 2px solid #2f9e44;"
-    "border-radius: 8px;"
-    "background: #eef9f1;"
-    "gridline-color: #dde5ee;"
-    "}"
-)
+# 리눅스(systemd)의 shutdown은 분 단위라 +2(2분 뒤)로 예약하고 -c로 취소한다.
+if sys.platform == "win32":
+    _SHUTDOWN_SCHEDULE_COMMAND = ["shutdown", "/s", "/t", "120"]
+    _SHUTDOWN_CANCEL_COMMAND = ["shutdown", "/a"]
+else:
+    _SHUTDOWN_SCHEDULE_COMMAND = ["shutdown", "-h", "+2"]
+    _SHUTDOWN_CANCEL_COMMAND = ["shutdown", "-c"]
 
 
 class DropArea(QFrame):
@@ -181,34 +183,29 @@ class DropArea(QFrame):
         super().__init__()
         self.setAcceptDrops(True)
         self.setFrameShape(QFrame.StyledPanel)
+        # 테두리·배경은 app/theme.py의 #dropArea 스타일을 따른다.
         self.setObjectName("dropArea")
-        self.setStyleSheet(
-            "#dropArea {"
-            "border: 2px dashed #6a7b8c;"
-            "border-radius: 10px;"
-            "background: #f5f8fb;"
-            "}"
-        )
+        self.setProperty("dragActive", False)
 
         layout = QVBoxLayout(self)
         label = QLabel(label_text)
+        label.setObjectName("dropAreaLabel")
         label.setAlignment(Qt.AlignCenter)
         label.setMinimumHeight(min_height)
         label.setWordWrap(word_wrap)
         if not word_wrap:
             label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        label.setStyleSheet("font-size: 18px; font-weight: 600; color: #31455a;")
         layout.addWidget(label)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
-            self.setStyleSheet(DROP_AREA_ACTIVE_STYLE)
+            set_dynamic_property(self, "dragActive", True)
             event.acceptProposedAction()
             return
         event.ignore()
 
     def dragLeaveEvent(self, event) -> None:
-        self.setStyleSheet(DROP_AREA_BASE_STYLE)
+        set_dynamic_property(self, "dragActive", False)
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event: QDropEvent) -> None:
@@ -216,7 +213,7 @@ class DropArea(QFrame):
         for url in event.mimeData().urls():
             if url.isLocalFile():
                 paths.append(url.toLocalFile())
-        self.setStyleSheet(DROP_AREA_BASE_STYLE)
+        set_dynamic_property(self, "dragActive", False)
         if paths:
             self.files_dropped.emit(paths)
         event.acceptProposedAction()
@@ -294,12 +291,13 @@ class DropTableWidget(QTableWidget):
     def __init__(self, rows: int, columns: int) -> None:
         super().__init__(rows, columns)
         self.setAcceptDrops(True)
-        self.setStyleSheet(DROP_TABLE_BASE_STYLE)
+        self.setProperty("dropTarget", True)
+        self.setProperty("dragActive", False)
         self.setWordWrap(False)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
-            self.setStyleSheet(DROP_TABLE_ACTIVE_STYLE)
+            set_dynamic_property(self, "dragActive", True)
             event.acceptProposedAction()
             return
         event.ignore()
@@ -311,7 +309,7 @@ class DropTableWidget(QTableWidget):
         event.ignore()
 
     def dragLeaveEvent(self, event) -> None:
-        self.setStyleSheet(DROP_TABLE_BASE_STYLE)
+        set_dynamic_property(self, "dragActive", False)
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event: QDropEvent) -> None:
@@ -319,7 +317,7 @@ class DropTableWidget(QTableWidget):
         for url in event.mimeData().urls():
             if url.isLocalFile():
                 paths.append(url.toLocalFile())
-        self.setStyleSheet(DROP_TABLE_BASE_STYLE)
+        set_dynamic_property(self, "dragActive", False)
         if paths:
             self.files_dropped.emit(paths)
         event.acceptProposedAction()
@@ -335,10 +333,13 @@ class CollapsibleSection(QWidget):
         self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         self.toggle_button.clicked.connect(self._toggle)
-        self.toggle_button.setStyleSheet("font-weight: 600; padding: 6px 0;")
+        self.toggle_button.setProperty("role", "sectionToggle")
 
         self.content = content
         self.content.setVisible(expanded)
+        if isinstance(content, QGroupBox) and not content.title():
+            # 제목은 접기 버튼이 대신하므로 그룹 상자 위쪽 여백을 줄인다.
+            content.setProperty("untitled", True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -349,6 +350,21 @@ class CollapsibleSection(QWidget):
     def _toggle(self, checked: bool) -> None:
         self.toggle_button.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
         self.content.setVisible(checked)
+
+
+def align_form_labels(*forms: QFormLayout) -> None:
+    """여러 QFormLayout의 이름 칸 너비를 맞춰 입력 칸이 같은 세로선에서 시작하게 한다."""
+    labels: list[QWidget] = []
+    for form in forms:
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
+        for row in range(form.rowCount()):
+            item = form.itemAt(row, QFormLayout.LabelRole)
+            if item is not None and item.widget() is not None:
+                labels.append(item.widget())
+    width = max((label.sizeHint().width() for label in labels), default=0)
+    for label in labels:
+        label.setMinimumWidth(width)
 
 
 class MainWindow(QMainWindow):
@@ -396,38 +412,55 @@ class MainWindow(QMainWindow):
         self._split_duration: float | None = None
         self._split_output_dir: Path | None = None
         self._pending_shutdown_label: str | None = None
+        # 언어·VAD를 고정하는 모델을 고르기 전의 사용자 선택값(다른 모델로 돌아가면 복원한다).
+        self._language_before_model_lock: str | None = None
+        self._vad_before_model_lock: bool | None = None
+        self._segmentation_before_model_lock: str | None = None
 
         self._translator_settings = load_translator_settings()
         self._saved_api_keys_text = "\n".join(load_api_keys())
         self._saved_deepl_api_key = load_deepl_api_key()
+        self._saved_openai_api_key = load_openai_api_key()
+        self._remote_settings = load_remote_settings(get_remote_settings_path())
         self._settings_dirty = False
         self._logger = get_logger()
         self.ui_log_signal.connect(self._append_ui_log)
         set_ui_log_callback(self.ui_log_signal.emit)
 
+        theme.ensure_theme(QApplication.instance())
+
         central = QWidget()
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(14, 14, 14, 14)
-        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(12, 10, 12, 12)
+        root_layout.setSpacing(6)
 
+        header = QHBoxLayout()
+        header.setSpacing(12)
         title_label = QLabel("일본어 음성 -> 한국어 자막 생성기")
-        title_label.setStyleSheet("font-size: 20px; font-weight: 700;")
-        root_layout.addWidget(title_label)
+        title_label.setProperty("role", "title")
+        header.addWidget(title_label)
 
         self.subtitle_label = QLabel("")
-        self.subtitle_label.setStyleSheet("color: #43556a;")
-        root_layout.addWidget(self.subtitle_label)
+        self.subtitle_label.setProperty("role", "hint")
+        self.subtitle_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        header.addWidget(self.subtitle_label, 1, Qt.AlignBottom)
+        root_layout.addLayout(header)
+        root_layout.addSpacing(2)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_main_tab(), "작업")
         self.tabs.addTab(self._build_subtitle_translate_tab(), "자막 번역")
         self.tabs.addTab(self._build_translation_tab(), "번역 설정")
         self.tabs.addTab(self._build_audio_split_tab(), "음성 분할")
+        self.tabs.addTab(self._build_runpod_tab(), "Runpod")
         root_layout.addWidget(self.tabs, 1)
 
         self.setCentralWidget(central)
         self._create_tray_icon()
         self.log("Program started")
+        # 기본 모델이 언어·VAD를 고정하는 모델(GPU의 anime-whisper)이면 시작할 때 바로 맞춘다.
+        if get_model_languages(self.current_model_key()) or model_requires_vad(self.current_model_key()):
+            self.apply_model_constraints()
         self.refresh_model_status()
 
     def _load_app_icon(self) -> QIcon | None:
@@ -442,17 +475,26 @@ class MainWindow(QMainWindow):
     def _build_main_tab(self) -> QWidget:
         content = QWidget()
         root_layout = QVBoxLayout(content)
-        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setContentsMargins(10, 10, 10, 10)
         root_layout.setSpacing(8)
 
         self.runtime_combo = QComboBox()
         self._populate_runtime_choices()
         self.runtime_combo.currentIndexChanged.connect(self.on_runtime_changed)
 
+        self.execution_combo = QComboBox()
+        for value, label in EXECUTION_OPTIONS:
+            self.execution_combo.addItem(label, value)
+        self.execution_combo.setToolTip(
+            "Runpod GPU (원격): 내 Runpod 계정에 GPU Pod를 잠깐 만들어 음성 인식(과 선택한 LLM 번역)을 하고, 끝나면 Pod를 지웁니다.\n"
+            "설정은 Runpod 탭에서 합니다. 시작 전에 예상 비용을 보여 주고 확인을 받습니다."
+        )
+        self.execution_combo.currentIndexChanged.connect(self.on_execution_changed)
+
         self.model_combo = QComboBox()
         for model_key, preset in MODEL_PRESETS.items():
             self.model_combo.addItem(str(preset["label"]), model_key)
-        self.model_combo.setCurrentIndex(max(0, self.model_combo.findData(DEFAULT_MODEL_KEY)))
+        self.model_combo.setCurrentIndex(max(0, self.model_combo.findData(get_default_model_key())))
         self.model_combo.currentIndexChanged.connect(self.on_model_changed)
 
         self.input_language_combo = QComboBox()
@@ -506,9 +548,31 @@ class MainWindow(QMainWindow):
         self.vad_mode_combo.setCurrentIndex(max(0, self.vad_mode_combo.findData(DEFAULT_VAD_ENABLED)))
         self.vad_mode_combo.currentIndexChanged.connect(self.on_vad_changed)
 
+        self.vad_backend_combo = QComboBox()
+        for value, label in VAD_BACKEND_OPTIONS:
+            self.vad_backend_combo.addItem(label, value)
+        self.vad_backend_combo.setCurrentIndex(max(0, self.vad_backend_combo.findData(DEFAULT_VAD_BACKEND)))
+        self.vad_backend_combo.setToolTip(
+            "ASMR (WhisperSeg): 속삭임·귓속말까지 잘 잡는 ASMR용 VAD입니다. 처음 쓸 때 모델(약 120MB)을 받습니다.\n"
+            "Silero: faster-whisper 내장 VAD입니다. 작은 소리는 대사가 아닌 것으로 보고 버리는 경우가 많습니다."
+        )
+        self.vad_backend_combo.currentIndexChanged.connect(self.on_vad_backend_changed)
+
+        self.segmentation_combo = QComboBox()
+        for value, label in SEGMENTATION_OPTIONS:
+            self.segmentation_combo.addItem(label, value)
+        self.segmentation_combo.setCurrentIndex(max(0, self.segmentation_combo.findData(DEFAULT_SEGMENTATION)))
+        self.segmentation_combo.setToolTip(
+            "구간별: VAD가 찾은 말소리 구간(최대 12초)마다 잘라 인식하고, 그 구간의 시작·끝을 자막 시간으로 씁니다.\n"
+            "  20~40초짜리 깨진 자막이 생기지 않고, 대사를 빠뜨리는 일이 적습니다.\n"
+            "일반: Whisper가 30초 창마다 스스로 문장과 자막 시간을 정합니다."
+        )
+
         self.vad_min_silence_spin = QSpinBox()
         self.vad_min_silence_spin.setRange(0, 5000)
-        self.vad_min_silence_spin.setValue(DEFAULT_VAD_MIN_SILENCE_MS)
+        self.vad_min_silence_spin.setValue(
+            WHISPERSEG_DEFAULT_MIN_SILENCE_MS if DEFAULT_VAD_BACKEND == "whisperseg" else DEFAULT_VAD_MIN_SILENCE_MS
+        )
 
         self.vad_speech_pad_spin = QSpinBox()
         self.vad_speech_pad_spin.setRange(0, 5000)
@@ -519,11 +583,12 @@ class MainWindow(QMainWindow):
         self.model_progress = QProgressBar()
         self.model_progress.setRange(0, 100)
         self.model_progress.setValue(0)
-        self.model_progress.setStyleSheet(GREEN_BAR_STYLE)
 
         settings_bar = QHBoxLayout()
         settings_bar.setSpacing(6)
-        settings_bar.addWidget(QLabel("작업 설정"))
+        settings_caption = QLabel("작업 설정")
+        settings_caption.setProperty("role", "hint")
+        settings_bar.addWidget(settings_caption)
         settings_bar.addWidget(self._build_settings_menu_button("STT 설정", self._create_stt_settings_menu()))
         settings_bar.addWidget(self._build_settings_menu_button("성능 설정", self._create_performance_settings_menu()))
         settings_bar.addWidget(self._build_settings_menu_button("처리 설정", self._create_process_settings_menu()))
@@ -532,9 +597,7 @@ class MainWindow(QMainWindow):
 
         self.main_settings_summary_label = QLabel("")
         self.main_settings_summary_label.setWordWrap(True)
-        self.main_settings_summary_label.setStyleSheet(
-            "padding: 8px 10px; border: 1px solid #d7e0ea; border-radius: 8px; background: #f6f9fc; color: #32465a;"
-        )
+        self.main_settings_summary_label.setProperty("role", "card")
         root_layout.addWidget(self.main_settings_summary_label)
 
         self._wire_main_settings_summary_signals()
@@ -545,17 +608,14 @@ class MainWindow(QMainWindow):
         self.stage_progress = QProgressBar()
         self.stage_progress.setRange(0, 100)
         self.stage_progress.setValue(0)
-        self.stage_progress.setStyleSheet(GREEN_BAR_STYLE)
         self.translation_progress_label = QLabel("번역 진행: 대기 중")
         self.translation_progress = QProgressBar()
         self.translation_progress.setRange(0, 100)
         self.translation_progress.setValue(0)
-        self.translation_progress.setStyleSheet(GREEN_BAR_STYLE)
         self.queue_progress_label = QLabel("전체 대기열 진행률 0 / 0")
         self.queue_progress = QProgressBar()
         self.queue_progress.setRange(0, 100)
         self.queue_progress.setValue(0)
-        self.queue_progress.setStyleSheet(GREEN_BAR_STYLE)
 
         button_host = QWidget()
         button_row = FlowLayout(button_host)
@@ -576,6 +636,7 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.remove_button)
 
         self.start_button = QPushButton("시작")
+        self.start_button.setProperty("role", "primary")
         self.start_button.clicked.connect(self.start_pipeline)
         button_row.addWidget(self.start_button)
         self.pause_button = QPushButton("일시 중지")
@@ -593,22 +654,35 @@ class MainWindow(QMainWindow):
         self.unload_model_button.clicked.connect(self.unload_model)
         button_row.addWidget(self.unload_model_button)
 
+        model_box = QGroupBox("모델")
+        model_layout = QVBoxLayout(model_box)
+        model_layout.setSpacing(4)
+        model_layout.addWidget(self.model_status_label)
+        model_layout.addWidget(self.model_runtime_state_label)
+        model_layout.addWidget(self.model_progress)
+        self.model_runtime_state_label.setProperty("role", "hint")
+
+        progress_box = QGroupBox("진행 상황")
+        progress_layout = QVBoxLayout(progress_box)
+        progress_layout.setSpacing(4)
+        progress_layout.addWidget(self.current_file_label)
+        progress_layout.addWidget(self.current_stage_label)
+        progress_layout.addWidget(self.stage_progress)
+        progress_layout.addSpacing(4)
+        progress_layout.addWidget(self.translation_progress_label)
+        progress_layout.addWidget(self.translation_progress)
+        progress_layout.addSpacing(4)
+        progress_layout.addWidget(self.queue_progress_label)
+        progress_layout.addWidget(self.queue_progress)
+
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setContentsMargins(0, 0, 4, 0)
         left_layout.setSpacing(8)
-        left_layout.addWidget(self.model_status_label)
-        left_layout.addWidget(self.model_runtime_state_label)
-        left_layout.addWidget(self.model_progress)
+        left_layout.addWidget(model_box)
         left_layout.addWidget(self.main_settings_summary_label)
         left_layout.addWidget(button_host)
-        left_layout.addWidget(self.current_file_label)
-        left_layout.addWidget(self.current_stage_label)
-        left_layout.addWidget(self.stage_progress)
-        left_layout.addWidget(self.translation_progress_label)
-        left_layout.addWidget(self.translation_progress)
-        left_layout.addWidget(self.queue_progress_label)
-        left_layout.addWidget(self.queue_progress)
+        left_layout.addWidget(progress_box)
         left_layout.addStretch(1)
         for label in (
             self.model_status_label,
@@ -679,7 +753,7 @@ class MainWindow(QMainWindow):
     def _build_audio_split_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
         extensions = " ".join(sorted(SPLIT_SUPPORTED_EXTENSIONS))
@@ -700,7 +774,7 @@ class MainWindow(QMainWindow):
 
         self.split_info_label = QLabel("")
         self.split_info_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.split_info_label.setStyleSheet("color: #43556a;")
+        self.split_info_label.setProperty("role", "hint")
         layout.addWidget(self.split_info_label)
 
         options = QHBoxLayout()
@@ -733,7 +807,7 @@ class MainWindow(QMainWindow):
             "다시 인코딩하지 않아 음질과 표지 이미지가 그대로 유지됩니다."
         )
         hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        hint.setStyleSheet("color: #5b6b7b;")
+        hint.setProperty("role", "hint")
         layout.addWidget(hint)
 
         self.split_table = QTableWidget(0, 2)
@@ -749,19 +823,20 @@ class MainWindow(QMainWindow):
         action_row = QHBoxLayout(split_action_host)
         action_row.setContentsMargins(0, 0, 0, 0)
         self.split_start_button = QPushButton("분할 시작")
+        self.split_start_button.setProperty("role", "primary")
         self.split_start_button.clicked.connect(self.start_audio_split)
         action_row.addWidget(self.split_start_button)
         self.split_open_button = QPushButton("저장 폴더 열기")
         self.split_open_button.clicked.connect(self.open_split_output_dir)
         action_row.addWidget(self.split_open_button)
         self.split_output_label = QLabel("")
+        self.split_output_label.setProperty("role", "hint")
         self.split_output_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         action_row.addWidget(self.split_output_label, 1)
 
         self.split_progress = QProgressBar()
         self.split_progress.setRange(0, 100)
         self.split_progress.setValue(0)
-        self.split_progress.setStyleSheet(GREEN_BAR_STYLE)
 
         self.split_log_view = QTextEdit()
         self.split_log_view.setReadOnly(True)
@@ -848,7 +923,7 @@ class MainWindow(QMainWindow):
                 end_text = format_timestamp(self._split_duration, True) if self._split_duration is not None else ""
                 end_item.setText(f"{end_text} (파일 끝)".strip())
                 end_item.setFlags(end_item.flags() & ~Qt.ItemIsEditable)
-                end_item.setForeground(QColor("#7a8794"))
+                end_item.setForeground(theme.color("muted"))
                 end_item.setData(Qt.UserRole, "auto")
             elif end_item.data(Qt.UserRole) == "auto":
                 end_item.setText("")
@@ -930,10 +1005,7 @@ class MainWindow(QMainWindow):
         button.setPopupMode(QToolButton.InstantPopup)
         button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         button.setMenu(menu)
-        button.setStyleSheet(
-            "QToolButton { padding: 6px 10px; border: 1px solid #c9d4df; border-radius: 8px; background: #ffffff; }"
-            "QToolButton::menu-indicator { subcontrol-position: right center; }"
-        )
+        button.setProperty("role", "settingsMenu")
         return button
 
     def _create_menu_field(self, label_text: str, widget: QWidget) -> QWidget:
@@ -956,6 +1028,7 @@ class MainWindow(QMainWindow):
     def _create_stt_settings_menu(self) -> QMenu:
         menu = QMenu(self)
         runtime_menu = menu.addMenu("실행 / 모델")
+        self._add_widget_action(runtime_menu, "실행 위치", self.execution_combo)
         self._add_widget_action(runtime_menu, "실행 장치", self.runtime_combo)
         self._add_widget_action(runtime_menu, "Whisper 모델", self.model_combo)
 
@@ -981,6 +1054,8 @@ class MainWindow(QMainWindow):
 
         vad_menu = menu.addMenu("VAD")
         self._add_widget_action(vad_menu, "VAD 필터", self.vad_mode_combo)
+        self._add_widget_action(vad_menu, "VAD 종류", self.vad_backend_combo)
+        self._add_widget_action(vad_menu, "인식 방식", self.segmentation_combo)
         self._add_widget_action(vad_menu, "최소 침묵(ms)", self.vad_min_silence_spin)
         self._add_widget_action(vad_menu, "패딩(ms)", self.vad_speech_pad_spin)
 
@@ -991,6 +1066,7 @@ class MainWindow(QMainWindow):
 
     def _wire_main_settings_summary_signals(self) -> None:
         self.runtime_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.execution_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
         self.model_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
         self.input_language_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
         self.output_language_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
@@ -1002,6 +1078,8 @@ class MainWindow(QMainWindow):
         self.auto_unload_checkbox.toggled.connect(self.refresh_main_settings_summary)
         self.shutdown_after_complete_checkbox.toggled.connect(self.refresh_main_settings_summary)
         self.vad_mode_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.vad_backend_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
+        self.segmentation_combo.currentIndexChanged.connect(self.refresh_main_settings_summary)
         self.vad_min_silence_spin.valueChanged.connect(self.refresh_main_settings_summary)
         self.vad_speech_pad_spin.valueChanged.connect(self.refresh_main_settings_summary)
         self.postprocess_checkbox.toggled.connect(self.refresh_main_settings_summary)
@@ -1011,12 +1089,12 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "main_settings_summary_label"):
             return
         summary = (
-            f"실행 {self.runtime_combo.currentText()} | 모델 {self.model_combo.currentText()} | "
+            f"실행 {self.describe_execution()} | 모델 {self.model_combo.currentText()} | "
             f"{self.input_language_combo.currentText()} -> "
             f"{self.output_language_combo.currentText() if self.translate_checkbox.isChecked() else '번역 안 함'} | "
             f"compute {self.compute_type_combo.currentText()} | CPU {self.cpu_threads_spin.value()} | "
             f"workers {self.num_workers_spin.value()} | RAM {self.memory_profile_combo.currentText()} | "
-            f"VAD {'ON' if self.is_vad_enabled() else 'OFF'} | "
+            f"{self.describe_vad_choice()} | "
             f"기본 후처리 {'ON' if self.postprocess_checkbox.isChecked() else 'OFF'} | "
             f"강화 후처리 {'ON' if self.enhanced_postprocess_checkbox.isChecked() else 'OFF'} | "
             f"완료 후 모델 해제 {'ON' if self.auto_unload_checkbox.isChecked() else 'OFF'} | "
@@ -1096,11 +1174,12 @@ class MainWindow(QMainWindow):
     def _build_subtitle_translate_tab(self) -> QWidget:
         content = QWidget()
         root_layout = QVBoxLayout(content)
-        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(8)
 
         info_row = QHBoxLayout()
         self.subtitle_translate_info_label = QLabel("입력 언어와 출력 언어는 작업 탭의 현재 설정을 사용합니다.")
-        self.subtitle_translate_info_label.setStyleSheet("color: #43556a;")
+        self.subtitle_translate_info_label.setProperty("role", "hint")
         info_row.addWidget(self.subtitle_translate_info_label)
         info_row.addStretch(1)
         root_layout.addLayout(info_row)
@@ -1123,6 +1202,7 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.subtitle_remove_button)
 
         self.subtitle_start_button = QPushButton("번역 시작")
+        self.subtitle_start_button.setProperty("role", "primary")
         self.subtitle_start_button.clicked.connect(self.start_subtitle_translation)
         button_row.addWidget(self.subtitle_start_button)
         button_row.addStretch(1)
@@ -1163,32 +1243,42 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
 
+        progress_box = QGroupBox("진행 상황")
+        progress_layout = QVBoxLayout(progress_box)
+        progress_layout.setSpacing(4)
+        root_layout.addWidget(progress_box)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(16)
         self.subtitle_current_file_label = QLabel("현재 파일: 없음")
-        root_layout.addWidget(self.subtitle_current_file_label)
+        self.subtitle_current_file_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        status_row.addWidget(self.subtitle_current_file_label, 3)
 
         self.subtitle_stage_label = QLabel("현재 단계: 대기 중")
-        root_layout.addWidget(self.subtitle_stage_label)
+        self.subtitle_stage_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        status_row.addWidget(self.subtitle_stage_label, 2)
+        progress_layout.addLayout(status_row)
 
         self.subtitle_translation_progress_label = QLabel("번역 진행: 대기 중")
-        root_layout.addWidget(self.subtitle_translation_progress_label)
+        progress_layout.addWidget(self.subtitle_translation_progress_label)
 
         self.subtitle_translation_progress = QProgressBar()
         self.subtitle_translation_progress.setRange(0, 100)
         self.subtitle_translation_progress.setValue(0)
-        self.subtitle_translation_progress.setStyleSheet(GREEN_BAR_STYLE)
-        root_layout.addWidget(self.subtitle_translation_progress)
+        progress_layout.addWidget(self.subtitle_translation_progress)
 
         self.subtitle_queue_progress_label = QLabel("전체 대기열 진행률 0 / 0")
-        root_layout.addWidget(self.subtitle_queue_progress_label)
+        progress_layout.addSpacing(4)
+        progress_layout.addWidget(self.subtitle_queue_progress_label)
 
         self.subtitle_queue_progress = QProgressBar()
         self.subtitle_queue_progress.setRange(0, 100)
         self.subtitle_queue_progress.setValue(0)
-        self.subtitle_queue_progress.setStyleSheet(GREEN_BAR_STYLE)
-        root_layout.addWidget(self.subtitle_queue_progress)
+        progress_layout.addWidget(self.subtitle_queue_progress)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setWidget(content)
@@ -1202,11 +1292,12 @@ class MainWindow(QMainWindow):
     def _build_translation_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
         save_row = QHBoxLayout()
         self.translation_settings_status = QLabel("")
-        self.translation_settings_status.setStyleSheet("color: #2f6f3e;")
+        self.translation_settings_status.setProperty("role", "success")
         save_row.addWidget(self.translation_settings_status)
         save_row.addStretch(1)
         self.save_translation_button = QPushButton("저장")
@@ -1215,10 +1306,15 @@ class MainWindow(QMainWindow):
         save_row.addWidget(self.save_translation_button)
         layout.addLayout(save_row)
 
-        api_box = QGroupBox("API 키")
+        api_box = QGroupBox()
         api_layout = QVBoxLayout(api_box)
-        api_layout.addWidget(QLabel("Gemini 키는 여러 개를 한 줄에 하나씩 입력하면 자동으로 순환 사용합니다."))
-        api_layout.addWidget(QLabel("Gemini가 끝까지 실패하면 저장된 DeepL Free API 키로 자동 폴백합니다."))
+        api_hint = QLabel(
+            "Gemini 키는 여러 개를 한 줄에 하나씩 입력하면 자동으로 순환 사용합니다.\n"
+            "Gemini가 끝까지 실패하면 저장된 DeepL Free API 키로 자동 폴백합니다."
+        )
+        api_hint.setProperty("role", "hint")
+        api_hint.setWordWrap(True)
+        api_layout.addWidget(api_hint)
         api_layout.addWidget(QLabel("Gemini API 키"))
         self.keys_edit = QPlainTextEdit(self._saved_api_keys_text)
         self.keys_edit.setPlaceholderText("AIza...")
@@ -1232,9 +1328,50 @@ class MainWindow(QMainWindow):
         self.deepl_key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
         self.deepl_key_edit.textChanged.connect(self.mark_translation_inputs_dirty)
         api_layout.addWidget(self.deepl_key_edit)
-        layout.addWidget(CollapsibleSection("API Keys", api_box, expanded=True))
+        layout.addWidget(CollapsibleSection("API 키", api_box, expanded=True))
 
-        option_box = QGroupBox("Gemini 번역 옵션")
+        provider_box = QGroupBox()
+        provider_form = QFormLayout(provider_box)
+        self.provider_combo = QComboBox()
+        for value, label in TRANSLATION_PROVIDER_OPTIONS:
+            self.provider_combo.addItem(label, value)
+        self.provider_combo.setCurrentIndex(max(0, self.provider_combo.findData(self._translator_settings.provider)))
+        self.provider_combo.currentIndexChanged.connect(self.mark_translation_inputs_dirty)
+        provider_form.addRow("번역에 쓸 곳", self.provider_combo)
+        self.openai_fallback_checkbox = QCheckBox("Gemini가 실패한 줄(한도 소진·차단)은 LLM 서버로 번역")
+        self.openai_fallback_checkbox.setChecked(self._translator_settings.use_openai_fallback)
+        self.openai_fallback_checkbox.toggled.connect(self.mark_translation_inputs_dirty)
+        provider_form.addRow("LLM 폴백", self.openai_fallback_checkbox)
+        self.openai_url_edit = QLineEdit(self._translator_settings.openai_base_url)
+        self.openai_url_edit.setPlaceholderText("예: http://127.0.0.1:8080/v1 (llama.cpp), http://127.0.0.1:11434/v1 (Ollama)")
+        self.openai_url_edit.textChanged.connect(self.mark_translation_inputs_dirty)
+        provider_form.addRow("LLM 서버 주소", self.openai_url_edit)
+        self.openai_model_edit = QLineEdit(self._translator_settings.openai_model)
+        self.openai_model_edit.setPlaceholderText("서버에 올라간 모델 이름")
+        self.openai_model_edit.textChanged.connect(self.mark_translation_inputs_dirty)
+        provider_form.addRow("LLM 모델", self.openai_model_edit)
+        self.openai_key_edit = QLineEdit(self._saved_openai_api_key)
+        self.openai_key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
+        self.openai_key_edit.setPlaceholderText("필요 없으면 비워 둠")
+        self.openai_key_edit.textChanged.connect(self.mark_translation_inputs_dirty)
+        provider_form.addRow("LLM API 키", self.openai_key_edit)
+        check_row = QHBoxLayout()
+        self.openai_check_button = QPushButton("연결 확인")
+        self.openai_check_button.clicked.connect(self.check_openai_connection)
+        check_row.addWidget(self.openai_check_button)
+        self.openai_check_label = QLabel("")
+        self.openai_check_label.setWordWrap(True)
+        check_row.addWidget(self.openai_check_label, 1)
+        provider_form.addRow("", check_row)
+        provider_note = QLabel(
+            "작업 탭에서 실행 위치를 Runpod GPU로 고르고 Runpod 탭에서 원격 LLM을 켜면, 이 주소 대신 그 Pod의 LLM을 씁니다."
+        )
+        provider_note.setWordWrap(True)
+        provider_note.setProperty("role", "hint")
+        provider_form.addRow("", provider_note)
+        layout.addWidget(CollapsibleSection("번역 공급자 (Gemini / LLM 서버)", provider_box, expanded=True))
+
+        option_box = QGroupBox()
         form = QFormLayout(option_box)
 
         self.model_edit = QLineEdit(self._translator_settings.preferred_model)
@@ -1279,9 +1416,9 @@ class MainWindow(QMainWindow):
         self.top_p_spin.setValue(self._translator_settings.top_p)
         self.top_p_spin.valueChanged.connect(self.mark_translation_inputs_dirty)
         form.addRow("Top-P", self.top_p_spin)
-        layout.addWidget(CollapsibleSection("Gemini Translation Options", option_box, expanded=True))
+        layout.addWidget(CollapsibleSection("Gemini 번역 옵션", option_box, expanded=True))
 
-        prompt_box = QGroupBox("프롬프트")
+        prompt_box = QGroupBox()
         prompt_layout = QVBoxLayout(prompt_box)
         prompt_layout.addWidget(QLabel("시스템 프롬프트"))
         self.system_prompt_edit = QPlainTextEdit(self._translator_settings.system_prompt)
@@ -1294,10 +1431,12 @@ class MainWindow(QMainWindow):
         self.note_edit.setMinimumHeight(140)
         self.note_edit.textChanged.connect(self.mark_translation_inputs_dirty)
         prompt_layout.addWidget(self.note_edit)
-        layout.addWidget(CollapsibleSection("Prompts", prompt_box, expanded=True), 1)
+        layout.addWidget(CollapsibleSection("프롬프트", prompt_box, expanded=True), 1)
+        align_form_labels(provider_form, form)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setWidget(content)
@@ -1307,6 +1446,222 @@ class MainWindow(QMainWindow):
         page_layout.setContentsMargins(0, 0, 0, 0)
         page_layout.addWidget(scroll)
         return page
+
+    # ----- Runpod 원격 실행 -----
+    def _build_runpod_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        intro = QLabel(
+            "내 Runpod 계정의 GPU로 음성 인식(과 선택하면 LLM 번역)을 돌립니다. 작업 탭 → 작업 설정 → STT 설정 → 실행 위치를 "
+            "'Runpod GPU'로 바꾸면 쓰입니다.\n"
+            "작업할 때만 Pod를 만들고 끝나면 삭제하므로 쓰지 않을 때 요금은 0입니다. 시작 전에 예상 비용을 보여 줍니다."
+        )
+        intro.setWordWrap(True)
+        intro.setProperty("role", "hint")
+        layout.addWidget(intro)
+
+        settings = self._remote_settings
+        box = QGroupBox("연결")
+        form = QFormLayout(box)
+        self.remote_mode_combo = QComboBox()
+        self.remote_mode_combo.addItem("자동: 작업 때 Pod를 만들고 끝나면 삭제", "auto")
+        self.remote_mode_combo.addItem("수동: 이미 떠 있는 워커 주소 사용", "manual")
+        self.remote_mode_combo.setCurrentIndex(max(0, self.remote_mode_combo.findData(settings.mode)))
+        self.remote_mode_combo.currentIndexChanged.connect(self._refresh_remote_controls)
+        form.addRow("연결 방식", self.remote_mode_combo)
+        self.runpod_key_edit = QLineEdit(load_runpod_api_key())
+        self.runpod_key_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
+        self.runpod_key_edit.setPlaceholderText("Runpod 콘솔 → Settings → API Keys에서 만든 키")
+        form.addRow("Runpod API 키", self.runpod_key_edit)
+        self.remote_gpu_combo = QComboBox()
+        for gpu_id, label, prices in GPU_CHOICES:
+            self.remote_gpu_combo.addItem(f"{label} (참고 ${prices['COMMUNITY']:.2f}~${prices['SECURE']:.2f}/h)", gpu_id)
+        self.remote_gpu_combo.setCurrentIndex(max(0, self.remote_gpu_combo.findData(settings.gpu_type_id)))
+        form.addRow("GPU", self.remote_gpu_combo)
+        self.remote_cloud_combo = QComboBox()
+        self.remote_cloud_combo.addItem("커뮤니티 클라우드(싸지만 재고가 적을 수 있음)", "COMMUNITY")
+        self.remote_cloud_combo.addItem("보안 클라우드(비쌈)", "SECURE")
+        self.remote_cloud_combo.setCurrentIndex(max(0, self.remote_cloud_combo.findData(settings.cloud_type)))
+        form.addRow("클라우드", self.remote_cloud_combo)
+        self.remote_manual_url_edit = QLineEdit(settings.manual_url)
+        self.remote_manual_url_edit.setPlaceholderText("https://<pod-id>-8000.proxy.runpod.net")
+        form.addRow("워커 주소(수동)", self.remote_manual_url_edit)
+        try:
+            saved_token = load_secret(REMOTE_WORKER_TOKEN_CREDENTIAL_NAME)
+        except CredentialStoreError:
+            saved_token = ""
+        self.remote_manual_token_edit = QLineEdit(saved_token)
+        self.remote_manual_token_edit.setEchoMode(QLineEdit.PasswordEchoOnEdit)
+        form.addRow("워커 토큰(수동)", self.remote_manual_token_edit)
+        layout.addWidget(box)
+
+        llm_box = QGroupBox("원격 LLM 번역")
+        llm_form = QFormLayout(llm_box)
+        self.remote_llm_combo = QComboBox()
+        for key, item in LLM_CHOICES.items():
+            self.remote_llm_combo.addItem(item["label"], key)
+        self.remote_llm_combo.setCurrentIndex(max(0, self.remote_llm_combo.findData(settings.llm_choice)))
+        llm_form.addRow("LLM 모델", self.remote_llm_combo)
+        self.remote_llm_role_combo = QComboBox()
+        self.remote_llm_role_combo.addItem("LLM으로 번역 (Gemini 한도를 쓰지 않음)", "primary")
+        self.remote_llm_role_combo.addItem("Gemini로 번역하고, 실패한 줄만 LLM으로", "fallback")
+        llm_form.addRow("쓰는 방식", self.remote_llm_role_combo)
+        layout.addWidget(llm_box)
+
+        safety_box = QGroupBox("비용 안전장치")
+        safety_form = QFormLayout(safety_box)
+        self.remote_idle_spin = QSpinBox()
+        self.remote_idle_spin.setRange(5, 120)
+        self.remote_idle_spin.setValue(int(settings.idle_minutes))
+        self.remote_idle_spin.setSuffix(" 분")
+        safety_form.addRow("요청이 없으면 자동 삭제", self.remote_idle_spin)
+        self.remote_max_hours_spin = QDoubleSpinBox()
+        self.remote_max_hours_spin.setRange(0.5, 48.0)
+        self.remote_max_hours_spin.setSingleStep(0.5)
+        self.remote_max_hours_spin.setValue(float(settings.max_hours))
+        self.remote_max_hours_spin.setSuffix(" 시간")
+        safety_form.addRow("최대 사용 시간", self.remote_max_hours_spin)
+        layout.addWidget(safety_box)
+
+        button_row = QHBoxLayout()
+        self.remote_save_button = QPushButton("저장")
+        self.remote_save_button.clicked.connect(self.save_remote_inputs)
+        button_row.addWidget(self.remote_save_button)
+        self.remote_leftover_button = QPushButton("남은 Pod 확인·삭제")
+        self.remote_leftover_button.clicked.connect(self.check_leftover_pods)
+        button_row.addWidget(self.remote_leftover_button)
+        self.remote_status_label = QLabel("")
+        self.remote_status_label.setWordWrap(True)
+        button_row.addWidget(self.remote_status_label, 1)
+        layout.addLayout(button_row)
+        layout.addStretch(1)
+        align_form_labels(form, llm_form, safety_form)
+        self._refresh_remote_controls()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        return scroll
+
+    def _refresh_remote_controls(self, *_args) -> None:
+        manual = self.remote_mode_combo.currentData() == "manual"
+        for widget in (self.runpod_key_edit, self.remote_gpu_combo, self.remote_cloud_combo, self.remote_llm_combo):
+            widget.setEnabled(not manual)
+        self.remote_manual_url_edit.setEnabled(manual)
+        self.remote_manual_token_edit.setEnabled(manual)
+
+    def current_execution(self) -> str:
+        return str(self.execution_combo.currentData() or "local")
+
+    def describe_execution(self) -> str:
+        if self.current_execution() == "runpod":
+            return "Runpod GPU(원격)"
+        return self.runtime_combo.currentText()
+
+    def on_execution_changed(self, _index: int) -> None:
+        if self.current_execution() == "runpod":
+            self.log("실행 위치: Runpod GPU(원격). 설정은 Runpod 탭에서 확인하세요.")
+        self.update_controls()
+
+    def collect_remote_settings(self) -> RemoteSettings:
+        return RemoteSettings(
+            mode=str(self.remote_mode_combo.currentData() or "auto"),
+            api_key=self.runpod_key_edit.text().strip(),
+            gpu_type_id=str(self.remote_gpu_combo.currentData()),
+            cloud_type=str(self.remote_cloud_combo.currentData() or "COMMUNITY"),
+            llm_choice=str(self.remote_llm_combo.currentData() or "none"),
+            idle_minutes=self.remote_idle_spin.value(),
+            max_hours=self.remote_max_hours_spin.value(),
+            manual_url=self.remote_manual_url_edit.text().strip(),
+            manual_token=self.remote_manual_token_edit.text().strip(),
+        )
+
+    def save_remote_inputs(self) -> None:
+        settings = self.collect_remote_settings()
+        try:
+            save_remote_settings(get_remote_settings_path(), settings)
+            save_runpod_api_key(settings.api_key)
+            if settings.manual_token:
+                save_secret(REMOTE_WORKER_TOKEN_CREDENTIAL_NAME, settings.manual_token)
+            else:
+                delete_secret(REMOTE_WORKER_TOKEN_CREDENTIAL_NAME)
+        except (CredentialStoreError, OSError) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Runpod 설정을 저장하지 못했습니다.\n\n{exc}")
+            return
+        self._remote_settings = settings
+        self.remote_status_label.setText("저장했습니다.")
+        self.log("Runpod 설정을 저장했습니다.")
+
+    def confirm_remote_cost(self, settings: RemoteSettings, source_paths: list[str]) -> float | bool | None:
+        """비용 안내를 보여 주고 확인을 받는다. 취소면 False, 확인이면 시간당 요금(수동 연결은 None)."""
+        if settings.mode == "auto" and not settings.api_key:
+            self.tabs.setCurrentIndex(self.tabs.count() - 1)
+            QMessageBox.warning(self, APP_NAME, "Runpod 탭에 Runpod API 키를 입력하고 저장하세요.")
+            return False
+        audio_seconds = probe_audio_seconds([Path(path) for path in source_paths])
+
+        def lookup(gpu_id: str, cloud: str) -> float | None:
+            try:
+                return RunpodApi(settings.api_key).gpu_price(gpu_id, cloud)
+            except RemoteError:
+                return None
+
+        estimate, message = prepare_cost_confirmation(settings, audio_seconds, lookup if settings.mode == "auto" else None)
+        answer = QMessageBox.question(self, f"{APP_NAME} - Runpod 비용 확인", message, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            self.log("Runpod 원격 실행을 취소했습니다.")
+            return False
+        if estimate is not None:
+            self.log(f"Runpod 비용 확인: 시간당 ${estimate.price_per_hour:.2f}, 예상 약 ${estimate.cost:.2f}")
+            return float(estimate.price_per_hour)
+        return None
+
+    def check_leftover_pods(self) -> None:
+        key = self.runpod_key_edit.text().strip()
+        if not key:
+            QMessageBox.information(self, APP_NAME, "Runpod API 키를 먼저 입력하세요.")
+            return
+        try:
+            pods = find_leftover_pods(key)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, APP_NAME, f"Pod 목록을 불러오지 못했습니다.\n\n{exc}")
+            return
+        if not pods:
+            self.remote_status_label.setText("이 앱이 만든 Pod가 남아 있지 않습니다.")
+            return
+        names = "\n".join(f"- {pod.get('name')} ({pod.get('id')}, {pod.get('desiredStatus', '')})" for pod in pods)
+        answer = QMessageBox.question(
+            self, APP_NAME, f"이 앱이 만든 Pod가 {len(pods)}개 남아 있습니다.\n{names}\n\n모두 삭제할까요?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        api = RunpodApi(key)
+        for pod in pods:
+            try:
+                api.delete_pod(str(pod["id"]))
+                self.log(f"남은 Pod 삭제: {pod.get('id')}")
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"남은 Pod 삭제 실패: {pod.get('id')} ({exc})", logging.ERROR)
+        self.remote_status_label.setText(f"Pod {len(pods)}개 삭제를 요청했습니다.")
+
+    def check_openai_connection(self) -> None:
+        url = self.openai_url_edit.text().strip()
+        if not url:
+            self.openai_check_label.setText("서버 주소를 입력하세요.")
+            return
+        try:
+            models = check_openai_endpoint(url, self.openai_key_edit.text().strip())
+        except Exception as exc:  # noqa: BLE001
+            self.openai_check_label.setText(f"연결 실패: {str(exc)[:160]}")
+            return
+        self.openai_check_label.setText(f"연결됨. 모델: {', '.join(models[:5]) or '(목록 없음)'}")
+        if models and not self.openai_model_edit.text().strip():
+            self.openai_model_edit.setText(models[0])
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._allow_close:
@@ -1396,9 +1751,27 @@ class MainWindow(QMainWindow):
             self.enhanced_postprocess_checkbox.setChecked(False)
 
     def on_vad_changed(self, _index: int) -> None:
-        vad_enabled = self.is_vad_enabled()
-        self.vad_min_silence_spin.setEnabled(vad_enabled)
-        self.vad_speech_pad_spin.setEnabled(vad_enabled)
+        self.update_controls()
+
+    def on_vad_backend_changed(self, _index: int) -> None:
+        # 최소 무음 기본값이 VAD마다 달라서(Silero 500ms, WhisperSeg 100ms), 바꾸지 않은 기본값이면 함께 바꾼다.
+        defaults = {"silero": DEFAULT_VAD_MIN_SILENCE_MS, "whisperseg": WHISPERSEG_DEFAULT_MIN_SILENCE_MS}
+        if self.vad_min_silence_spin.value() in defaults.values():
+            self.vad_min_silence_spin.setValue(defaults.get(self.current_vad_backend(), DEFAULT_VAD_MIN_SILENCE_MS))
+        self.update_controls()
+
+    def current_vad_backend(self) -> str:
+        return str(self.vad_backend_combo.currentData() or DEFAULT_VAD_BACKEND)
+
+    def current_segmentation(self) -> str:
+        return str(self.segmentation_combo.currentData() or DEFAULT_SEGMENTATION)
+
+    def describe_vad_choice(self) -> str:
+        if not self.is_vad_enabled():
+            return "VAD OFF"
+        backend = "ASMR VAD" if self.current_vad_backend() == "whisperseg" else "Silero VAD"
+        mode = "구간별" if self.current_segmentation() == "clips" else "일반"
+        return f"{backend} · {mode}"
 
     def on_shutdown_after_complete_changed(self, checked: bool) -> None:
         if not checked and self._shutdown_scheduled:
@@ -1418,6 +1791,8 @@ class MainWindow(QMainWindow):
             enabled=self.is_vad_enabled(),
             min_silence_duration_ms=self.vad_min_silence_spin.value(),
             speech_pad_ms=self.vad_speech_pad_spin.value(),
+            backend=self.current_vad_backend(),
+            segmentation=self.current_segmentation(),
         )
 
     def is_vad_enabled(self) -> bool:
@@ -1434,8 +1809,53 @@ class MainWindow(QMainWindow):
         )
 
     def on_model_changed(self) -> None:
+        self.apply_model_constraints()
         self.refresh_model_status()
         self.refresh_main_settings_summary()
+
+    def _model_locks_language(self) -> bool:
+        return bool(get_model_languages(self.current_model_key()))
+
+    def apply_model_constraints(self) -> None:
+        """모델마다 지원 언어·인식 방식이 달라서, 고른 모델에 맞게 입력 언어와 VAD를 고정하거나 되돌린다."""
+        model_key = self.current_model_key()
+        languages = get_model_languages(model_key)
+        if languages:
+            if self._language_before_model_lock is None:
+                self._language_before_model_lock = self.current_input_language()
+            if self.current_input_language() not in languages:
+                self.input_language_combo.setCurrentIndex(max(0, self.input_language_combo.findData(languages[0])))
+        elif self._language_before_model_lock is not None:
+            self.input_language_combo.setCurrentIndex(
+                max(0, self.input_language_combo.findData(self._language_before_model_lock))
+            )
+            self._language_before_model_lock = None
+
+        if model_requires_vad(model_key):
+            if self._vad_before_model_lock is None:
+                self._vad_before_model_lock = self.is_vad_enabled()
+                self._segmentation_before_model_lock = self.current_segmentation()
+            self.vad_mode_combo.setCurrentIndex(max(0, self.vad_mode_combo.findData(True)))
+            self.segmentation_combo.setCurrentIndex(max(0, self.segmentation_combo.findData("clips")))
+        elif self._vad_before_model_lock is not None:
+            self.vad_mode_combo.setCurrentIndex(max(0, self.vad_mode_combo.findData(self._vad_before_model_lock)))
+            self._vad_before_model_lock = None
+            if self._segmentation_before_model_lock is not None:
+                self.segmentation_combo.setCurrentIndex(
+                    max(0, self.segmentation_combo.findData(self._segmentation_before_model_lock))
+                )
+                self._segmentation_before_model_lock = None
+
+        note = get_model_note(model_key)
+        lock_tip = f"{get_model_label(model_key)}: {note}" if note else ""
+        self.input_language_combo.setToolTip(lock_tip if languages else "")
+        self.vad_mode_combo.setToolTip(lock_tip if model_requires_vad(model_key) else "")
+        if model_requires_vad(model_key):
+            self.segmentation_combo.setToolTip(lock_tip)
+        self.model_combo.setToolTip(note)
+        if note:
+            self.log(f"{get_model_label(model_key)} | {note}")
+        self.update_controls()
 
     def collect_translation_inputs(self) -> TranslatorSettings:
         return TranslatorSettings(
@@ -1449,6 +1869,10 @@ class MainWindow(QMainWindow):
             reasoning_level=self.reasoning_combo.currentText(),
             system_prompt=self.system_prompt_edit.toPlainText(),
             translation_note=self.note_edit.toPlainText(),
+            provider=str(self.provider_combo.currentData() or "gemini"),
+            use_openai_fallback=self.openai_fallback_checkbox.isChecked(),
+            openai_base_url=self.openai_url_edit.text().strip(),
+            openai_model=self.openai_model_edit.text().strip(),
         )
 
     def translator_settings(self) -> TranslatorSettings:
@@ -1473,6 +1897,7 @@ class MainWindow(QMainWindow):
             save_translator_settings(settings)
             save_api_keys(keys_text)
             save_deepl_api_key(deepl_key)
+            save_openai_api_key(self.openai_key_edit.text())
         except CredentialStoreError as exc:
             self.log(f"API 키 보안 저장 실패: {exc}", logging.ERROR)
             QMessageBox.warning(self, APP_NAME, f"API 키를 안전하게 저장하지 못했습니다.\n\n{exc}")
@@ -1483,6 +1908,7 @@ class MainWindow(QMainWindow):
             return
         self._saved_api_keys_text = keys_text
         self._saved_deepl_api_key = deepl_key
+        self._saved_openai_api_key = self.openai_key_edit.text().strip()
         self._translator_settings = settings
         self._settings_dirty = False
         self.sync_translation_save_state()
@@ -1496,21 +1922,22 @@ class MainWindow(QMainWindow):
         self.list_stack.setCurrentWidget(target)
 
     def update_row_appearance(self, row: int, status: str) -> None:
-        color = None
+        kind = None
         if status in {STATUS_TRANSCRIBING, STATUS_TRANSLATING, STATUS_SAVING}:
-            color = QColor("#e8f2ff")
+            kind = "running"
         elif status == STATUS_DONE:
-            color = QColor("#e7f7ea")
+            kind = "done"
         elif status == STATUS_FAILED:
-            color = QColor("#fdeaea")
+            kind = "failed"
         elif status == STATUS_SKIPPED:
-            color = QColor("#f7f3e8")
+            kind = "skipped"
+        color = theme.row_color(kind)
 
         for column in range(self.table.columnCount()):
             item = self.table.item(row, column)
             if item is None:
                 continue
-            item.setBackground(color if color is not None else QColor("#ffffff"))
+            item.setBackground(color)
 
     def sync_translation_save_state(self) -> None:
         if not hasattr(self, "save_translation_button"):
@@ -1551,7 +1978,10 @@ class MainWindow(QMainWindow):
         download_running = self._download_worker is not None and self._download_worker.isRunning()
         processing_running = self._pipeline_worker is not None and self._pipeline_worker.isRunning()
         subtitle_processing_running = self._subtitle_translation_worker is not None and self._subtitle_translation_worker.isRunning()
-        enabled = not download_running and not processing_running and not subtitle_processing_running
+        # 메인 작업과 자막 번역 탭은 서로 독립이라 한쪽이 돌고 있어도 다른 쪽을 시작할 수 있다.
+        # 자막 번역 탭은 음성 모델을 쓰지 않으므로 모델 다운로드와도 상관없다.
+        enabled = not download_running and not processing_running
+        subtitle_enabled = not subtitle_processing_running
 
         self.add_button.setEnabled(True)
         self.add_folder_button.setEnabled(True)
@@ -1560,7 +1990,7 @@ class MainWindow(QMainWindow):
         self.remove_button.setEnabled(has_rows)
         self.runtime_combo.setEnabled(enabled)
         self.model_combo.setEnabled(enabled)
-        self.input_language_combo.setEnabled(enabled)
+        self.input_language_combo.setEnabled(enabled and not self._model_locks_language())
         self.output_language_combo.setEnabled(True)
         self.compute_type_combo.setEnabled(enabled)
         self.cpu_threads_spin.setEnabled(enabled and self.current_runtime_device() == "cpu")
@@ -1568,13 +1998,19 @@ class MainWindow(QMainWindow):
         self.memory_profile_combo.setEnabled(enabled)
         self.auto_unload_checkbox.setEnabled(True)
         self.shutdown_after_complete_checkbox.setEnabled(True)
-        self.vad_mode_combo.setEnabled(enabled)
+        model_locks_vad = model_requires_vad(self.current_model_key())
+        self.vad_mode_combo.setEnabled(enabled and not model_locks_vad)
+        self.vad_backend_combo.setEnabled(enabled and self.is_vad_enabled())
+        self.segmentation_combo.setEnabled(enabled and self.is_vad_enabled() and not model_locks_vad)
         self.vad_min_silence_spin.setEnabled(enabled and self.is_vad_enabled())
         self.vad_speech_pad_spin.setEnabled(enabled and self.is_vad_enabled())
         self.postprocess_checkbox.setEnabled(enabled)
         self.enhanced_postprocess_checkbox.setEnabled(enabled)
         self.translate_checkbox.setEnabled(enabled)
-        self.start_button.setEnabled(self._model_ready and has_pending and enabled)
+        remote = self.current_execution() == "runpod"
+        self.start_button.setEnabled((self._model_ready or remote) and has_pending and enabled)
+        self.execution_combo.setEnabled(enabled)
+        self.runtime_combo.setEnabled(enabled and not remote)
         self.pause_button.setEnabled(processing_running and not getattr(self._pipeline_worker, "_pause_requested", False))
         self.resume_button.setEnabled(processing_running and getattr(self._pipeline_worker, "_pause_requested", False))
         self.subtitle_add_button.setEnabled(True)
@@ -1582,7 +2018,7 @@ class MainWindow(QMainWindow):
         self.subtitle_include_subdirs_checkbox.setEnabled(True)
         self.subtitle_drop_area.setEnabled(True)
         self.subtitle_remove_button.setEnabled(has_subtitle_rows)
-        self.subtitle_start_button.setEnabled(has_subtitle_pending and enabled)
+        self.subtitle_start_button.setEnabled(has_subtitle_pending and subtitle_enabled)
         self.retry_download_button.setEnabled(not download_running and not self._model_ready)
         self.unload_model_button.setEnabled(not processing_running)
         self.tabs.setTabEnabled(1, True)
@@ -1709,21 +2145,22 @@ class MainWindow(QMainWindow):
         self.subtitle_list_stack.setCurrentWidget(target)
 
     def update_subtitle_row_appearance(self, row: int, status: str) -> None:
-        color = None
+        kind = None
         if status in {STATUS_TRANSLATING, STATUS_SAVING}:
-            color = QColor("#e8f2ff")
+            kind = "running"
         elif status == STATUS_DONE:
-            color = QColor("#e7f7ea")
+            kind = "done"
         elif status == STATUS_FAILED:
-            color = QColor("#fdeaea")
+            kind = "failed"
         elif status == STATUS_SKIPPED:
-            color = QColor("#f7f3e8")
+            kind = "skipped"
+        color = theme.row_color(kind)
 
         for column in range(self.subtitle_table.columnCount()):
             item = self.subtitle_table.item(row, column)
             if item is None:
                 continue
-            item.setBackground(color if color is not None else QColor("#ffffff"))
+            item.setBackground(color)
 
     def refresh_subtitle_queue_progress(self) -> None:
         if self._subtitle_queue_total > 0:
@@ -1819,7 +2256,16 @@ class MainWindow(QMainWindow):
         elif status == STATUS_REMOVED:
             self._remove_subtitle_paths([source_path])
 
-    def _check_translation_keys(self, api_keys: list[str], deepl_api_key: str) -> bool:
+    def _check_translation_keys(self, api_keys: list[str], deepl_api_key: str, remote_llm: bool = False) -> bool:
+        settings = self.translator_settings()
+        if remote_llm:
+            return True
+        if settings.provider == "openai":
+            if not settings.openai_base_url or not settings.openai_model:
+                self.tabs.setCurrentIndex(2)
+                QMessageBox.warning(self, APP_NAME, "LLM 서버로 번역하려면 번역 설정 탭에서 서버 주소와 모델 이름을 입력하고 저장하세요.")
+                return False
+            return True
         use_deepl = self.translator_settings().use_deepl_fallback
         if use_deepl and not deepl_api_key:
             self.tabs.setCurrentIndex(2)
@@ -1866,6 +2312,7 @@ class MainWindow(QMainWindow):
             translator_settings=self._job_translator_settings(),
             api_keys=api_keys,
             deepl_api_key=deepl_api_key,
+            openai_api_key=load_openai_api_key(),
         )
         self._subtitle_translation_worker = SubtitleTranslationWorker(job, self)
         self._subtitle_translation_worker.item_status_changed.connect(self.update_subtitle_item_status)
@@ -1877,6 +2324,8 @@ class MainWindow(QMainWindow):
         self._subtitle_translation_worker.summary_ready.connect(self.on_subtitle_summary_ready)
         self._subtitle_translation_worker.failed.connect(self.on_subtitle_failed)
         self._subtitle_translation_worker.finished.connect(self._run_pending_shutdown)
+        # summary/failed 신호는 스레드가 완전히 끝나기 전에 도착할 수 있어 끝난 뒤 버튼 상태를 한 번 더 맞춘다.
+        self._subtitle_translation_worker.finished.connect(self.update_controls)
         self._subtitle_translation_worker.start()
         self.update_controls()
         self.subtitle_log_view.append(
@@ -2018,11 +2467,14 @@ class MainWindow(QMainWindow):
 
     def start_pipeline(self) -> None:
         enable_translation = self.translate_checkbox.isChecked()
+        remote = self.current_execution() == "runpod"
+        remote_settings = self.collect_remote_settings() if remote else None
+        remote_llm = bool(remote_settings and remote_settings.llm_choice != "none")
         api_keys = load_api_keys() if enable_translation else []
         deepl_api_key = load_deepl_api_key() if enable_translation else ""
-        if enable_translation and not self._check_translation_keys(api_keys, deepl_api_key):
+        if enable_translation and not self._check_translation_keys(api_keys, deepl_api_key, remote_llm):
             return
-        if not self._model_ready:
+        if not remote and not self._model_ready:
             self.log("모델 준비 전에는 작업을 시작할 수 없습니다.")
             return
 
@@ -2030,6 +2482,12 @@ class MainWindow(QMainWindow):
         if not source_paths:
             self.log("처리할 파일이 없습니다.")
             return
+        confirmed_price = None
+        if remote_settings is not None:
+            confirmed = self.confirm_remote_cost(remote_settings, source_paths)
+            if confirmed is False:
+                return
+            confirmed_price = confirmed if isinstance(confirmed, float) else None
 
         for source_path in source_paths:
             self.update_item_status(source_path, STATUS_PENDING)
@@ -2061,6 +2519,10 @@ class MainWindow(QMainWindow):
             api_keys=api_keys,
             deepl_api_key=deepl_api_key,
             enable_translation=enable_translation,
+            openai_api_key=load_openai_api_key(),
+            remote=remote_settings,
+            remote_confirmed_price=confirmed_price,
+            remote_llm_role=self.remote_llm_role_combo.currentData() or "primary",
         )
         self._pipeline_worker = PipelineWorker(job, self)
         self._pipeline_worker.item_status_changed.connect(self.update_item_status)
@@ -2074,13 +2536,14 @@ class MainWindow(QMainWindow):
         self._pipeline_worker.summary_ready.connect(self.on_pipeline_summary_ready)
         self._pipeline_worker.failed.connect(self.on_pipeline_failed)
         self._pipeline_worker.finished.connect(self._run_pending_shutdown)
+        self._pipeline_worker.finished.connect(self.update_controls)
         self._pipeline_worker.start()
         self.update_controls()
         self.log(
             f"작업 시작: {len(source_paths)}개 파일, 장치={self.runtime_combo.currentText()}, "
             f"모델={self.model_combo.currentText()}, 입력 언어={self.input_language_combo.currentText()}, "
             f"출력 언어={self.output_language_combo.currentText() if enable_translation else '번역 안 함'}, "
-            f"VAD={'ON' if self.is_vad_enabled() else 'OFF (Whisper only)'}"
+            f"VAD={self.describe_vad_choice()}"
         )
 
     def refresh_queue_progress(self) -> None:
@@ -2240,7 +2703,7 @@ class MainWindow(QMainWindow):
         if not self.shutdown_after_complete_checkbox.isChecked() or self._shutdown_scheduled:
             return
         try:
-            subprocess.run(["shutdown", "/s", "/t", "120"], check=True, capture_output=True, text=True, creationflags=_NO_WINDOW)
+            subprocess.run(_SHUTDOWN_SCHEDULE_COMMAND, check=True, capture_output=True, text=True, creationflags=_NO_WINDOW)
         except Exception as exc:
             message = f"{job_label} 완료 후 자동 종료 예약에 실패했습니다: {str(exc) or exc.__class__.__name__}"
             self.log(message)
@@ -2257,7 +2720,7 @@ class MainWindow(QMainWindow):
 
     def _cancel_scheduled_shutdown(self) -> None:
         try:
-            subprocess.run(["shutdown", "/a"], check=True, capture_output=True, text=True, creationflags=_NO_WINDOW)
+            subprocess.run(_SHUTDOWN_CANCEL_COMMAND, check=True, capture_output=True, text=True, creationflags=_NO_WINDOW)
         except Exception as exc:
             self.log(f"예약된 시스템 종료 취소에 실패했습니다: {str(exc) or exc.__class__.__name__}")
             return
